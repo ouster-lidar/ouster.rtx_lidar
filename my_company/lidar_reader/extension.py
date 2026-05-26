@@ -844,11 +844,6 @@ try:
 except ImportError:
     print("Ouster SDK is not available. Ensure it is installed in the Python environment.")
 
-try:
-    from isaacsim.sensors.physx import _range_sensor
-except ImportError:
-    _range_sensor = None
-
 class ExistingLidarReader(omni.ext.IExt):
 
     # Path to the RTXLidar sensor configuration that Isaac Sim uses.
@@ -879,6 +874,7 @@ class ExistingLidarReader(omni.ext.IExt):
         scan_rate_hz = int(lidar_cfg["scanRateBaseHz"])
         report_rate_hz = int(lidar_cfg["reportRateBaseHz"])
         columns_per_frame = int(report_rate_hz / scan_rate_hz)
+        self._max_returns = max_returns
 
         sensor_info = SensorInfo()
         sensor_info.sn = 1234567890
@@ -963,7 +959,6 @@ class ExistingLidarReader(omni.ext.IExt):
         self._timeline_sub = None
         self._is_shutting_down = False
         self._session_active = False
-        self._output_dir = Path("/home/unaal/nvidia/kit-app-template/tmp")
         self._frame_id = 0
         self._pkt_count = 0
         self._writer = None
@@ -981,9 +976,9 @@ class ExistingLidarReader(omni.ext.IExt):
         self._sensor_info = self.compose_sensor_info_from_lidar_config(self.LIDAR_CONFIG_PATH)
         self.dump_sensor_info(self._sensor_info)
 
-        elevation_lut_rad = np.radians(self._sensor_info.beam_altitude_angles, dtype=np.float64)
-        self._elevation_lut_order = np.argsort(elevation_lut_rad)
-        self._elevation_lut_rad_sorted = elevation_lut_rad[self._elevation_lut_order]
+        elevation_lut_deg = np.array(self._sensor_info.beam_altitude_angles, dtype=np.float64)
+        self._elevation_lut_order = np.argsort(elevation_lut_deg)
+        self._elevation_lut_deg_sorted = elevation_lut_deg[self._elevation_lut_order]
 
         self._timeline_sub = self._timeline.get_timeline_event_stream().create_subscription_to_pop(
             self._on_timeline_event, name="existing_lidar_reader_timeline"
@@ -1085,6 +1080,24 @@ class ExistingLidarReader(omni.ext.IExt):
         self._session_active = False
         print("[ExistingLidarReader] Streaming session stopped")
 
+    def _configure_sensor_outputs(self):
+        stage = omni.usd.get_context().get_stage()
+        sensor_prim = stage.GetPrimAtPath(self.sensor_path) if stage else None
+        if sensor_prim is None or not sensor_prim.IsValid():
+            print(f"[ExistingLidarReader] WARNING: sensor prim {self.sensor_path} is not valid")
+            return
+
+        sensor_attrs = {
+            "omni:sensor:Core:outputFrameOfReference": "SENSOR",
+            "omni:sensor:Core:auxOutputType": "FULL",
+        }
+        for attr_name, attr_value in sensor_attrs.items():
+            attr = sensor_prim.GetAttribute(attr_name)
+            if not attr or not attr.IsValid():
+                print(f"[ExistingLidarReader] WARNING: sensor prim is missing attribute {attr_name}")
+                continue
+            attr.Set(attr_value)
+
     async def _setup_pipeline_async(self):
         """Safely attaches the annotator to the existing sensor."""
         await omni.kit.app.get_app().next_update_async()
@@ -1092,20 +1105,27 @@ class ExistingLidarReader(omni.ext.IExt):
         if self._is_shutting_down:
             return
 
+        self._configure_sensor_outputs()
+
         # 1. Create the Render Product pointing at the existing sensor path
-        self.render_product = rep.create.render_product(self.sensor_path, [1, 1])
+        self.render_product = rep.create.render_product(
+            self.sensor_path,
+            [1, 1],
+            name="RtxSensorRenderProduct",
+            render_vars=["GenericModelOutput", "RtxSensorMetadata"],
+        )
         self.render_product_path = self.render_product.path
 
         # 2. Initialize the safe ScanBuffer annotator
-        self.annotator = rep.AnnotatorRegistry.get_annotator(
-            "RtxSensorCpuIsaacCreateRTXLidarScanBuffer",
-            init_params={
-                "keepOnlyPositiveDistance": False,
-                "transformPoints": False,
-                "outputTimestamp": True,
-                "outputAzimuth": True,
-                "outputElevation": True
-            },
+        self.annotator = rep.AnnotatorRegistry.get_annotator("IsaacCreateRTXLidarScanBuffer")
+        self.annotator.initialize(
+            outputIntensity=True,
+            outputDistance=True,
+            keepOnlyPositiveDistance=False,
+            transformPoints=False,
+            outputTimestamp=True,
+            outputAzimuth=True,
+            outputElevation=True
         )
 
         # 3. Attach and let Replicator build the graph
@@ -1150,7 +1170,7 @@ class ExistingLidarReader(omni.ext.IExt):
             self._scan_range_m.fill(0)
             self._scan_intensity.fill(0)
 
-        elevation_lut = self._elevation_lut_rad_sorted
+        elevation_lut = self._elevation_lut_deg_sorted
         elevation_order = self._elevation_lut_order
 
         # u: nearest elevation row. Searchsorted avoids the old height x samples
@@ -1162,9 +1182,9 @@ class ExistingLidarReader(omni.ext.IExt):
         u = np.where(use_right, elevation_order[right_idx], elevation_order[left_idx]).astype(np.intp, copy=False)
         np.clip(u, 0, height - 1, out=u)
 
-        # v: azimuth is already radians. Wrap negative angles into [0, 2*pi)
+        # v: azimuth is already degrees. Wrap negative angles into [0, 360)
         # and bin directly into [0, width), avoiding deg/rad conversions.
-        v = np.floor(np.remainder(azimuth, 2.0 * np.pi) * (width / (2.0 * np.pi))).astype(np.intp)
+        v = np.floor(np.remainder(azimuth, 360.0) * (width / 360.0)).astype(np.intp)
         np.clip(v, 0, width - 1, out=v)
 
         self._scan_range_m[u, v] = distance
@@ -1232,19 +1252,19 @@ class ExistingLidarReader(omni.ext.IExt):
         if scan_data is None or "distance" not in scan_data or "intensity" not in scan_data:
             return
 
-        info = scan_data.get("info", {})
-        width = info.get("ticksPerScan", 0)
-        height = info.get("numChannels", 0)
-        echoes = info.get("numEchos", 1)
+        points3d = scan_data.get("data", None)
+        distance = np.asarray(scan_data["distance"])
+        intensity = np.asarray(scan_data["intensity"])
+        azimuth = np.asarray(scan_data["azimuth"])
+        elevation = np.asarray(scan_data["elevation"])
 
-        if width <= 0 or height <= 0 or echoes <= 0:
-            print(f"[ExistingLidarReader] ERROR: width {width}, height {height}, echoes {echoes} are invalid")
+        if distance.size == 0 or intensity.size == 0 or azimuth.size == 0 or elevation.size == 0:
             return
 
-        distance  = scan_data["distance"]
-        intensity = scan_data["intensity"]
-        azimuth   = scan_data["azimuth"]
-        elevation = scan_data["elevation"]
+        # Isaac Sim 5.1 still exposes these fields on info, but they are deprecated and
+        # may stay zero even when the scan buffer contains valid returns.
+        width = int(self._sensor_info.format.columns_per_frame)
+        height = int(self._sensor_info.format.pixels_per_column)
 
         scan_range_m, scan_intensity = self._map_distance_to_u_v(
             width, height, distance, intensity, azimuth, elevation)
