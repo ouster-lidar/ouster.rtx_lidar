@@ -821,7 +821,6 @@ class ScanSourceUdpReplay():
 
 
 import omni.ext
-import omni.usd
 import omni.kit.app
 import omni.timeline
 import omni.replicator.core as rep
@@ -949,7 +948,7 @@ class ExistingLidarReader(omni.ext.IExt):
 
 
     def on_startup(self, ext_id):
-        self.sensor_path = "/OS0_REV7_128_10hz___1024_resolution/sensor"
+        self.sensor_path = "/World/OS0_REV7_128_10hz___1024_resolution/sensor"
         self._timeline = omni.timeline.get_timeline_interface()
         self.render_product = None
         self.render_product_path = None
@@ -1018,7 +1017,7 @@ class ExistingLidarReader(omni.ext.IExt):
         self._packet_sender_stop = threading.Event()
 
         if self._http_server is None:
-            self._http_server = HttpServer(self, "127.0.0.1", 8080, autostart=False)
+            self._http_server = HttpServer(self, "127.0.0.1", 7070, autostart=False)
         self._http_server.start()
 
         initialized = False
@@ -1080,32 +1079,12 @@ class ExistingLidarReader(omni.ext.IExt):
         self._session_active = False
         print("[ExistingLidarReader] Streaming session stopped")
 
-    def _configure_sensor_outputs(self):
-        stage = omni.usd.get_context().get_stage()
-        sensor_prim = stage.GetPrimAtPath(self.sensor_path) if stage else None
-        if sensor_prim is None or not sensor_prim.IsValid():
-            print(f"[ExistingLidarReader] WARNING: sensor prim {self.sensor_path} is not valid")
-            return
-
-        sensor_attrs = {
-            "omni:sensor:Core:outputFrameOfReference": "SENSOR",
-            "omni:sensor:Core:auxOutputType": "FULL",
-        }
-        for attr_name, attr_value in sensor_attrs.items():
-            attr = sensor_prim.GetAttribute(attr_name)
-            if not attr or not attr.IsValid():
-                print(f"[ExistingLidarReader] WARNING: sensor prim is missing attribute {attr_name}")
-                continue
-            attr.Set(attr_value)
-
     async def _setup_pipeline_async(self):
         """Safely attaches the annotator to the existing sensor."""
         await omni.kit.app.get_app().next_update_async()
 
         if self._is_shutting_down:
             return
-
-        self._configure_sensor_outputs()
 
         # 1. Create the Render Product pointing at the existing sensor path
         self.render_product = rep.create.render_product(
@@ -1318,3 +1297,36 @@ class ExistingLidarReader(omni.ext.IExt):
         self.render_product = None
         self.render_product_path = None
         self._http_server = None
+
+    def _save_image(self, image_path, img_data):
+        min_distance = float(np.min(img_data))
+        max_distance = float(np.max(img_data))
+        if max_distance > min_distance:
+            normalized = (img_data - min_distance) / (max_distance - min_distance)
+        else:
+            normalized = np.ones_like(img_data, dtype=np.float32)
+        image_array = np.clip(normalized * 255.0, 0, 255).astype(np.uint8)
+        from PIL import Image
+        Image.fromarray(image_array, mode="L").save(image_path)
+
+    def _generate_debug_frame(self, frame_id, points3d, distance, intensity, azimuth, elevation):
+        SAVE_PATH = Path("/home/unaal/nvidia/isaac-sim-ext")
+        points3d_array = np.asarray(points3d)
+        points3d_array = points3d_array.reshape(-1, 3)
+        points3d_array = np.concatenate((points3d_array, distance.reshape(-1, 1), azimuth.reshape(-1, 1), elevation.reshape(-1, 1)), axis=1)
+        xyz_path = SAVE_PATH / f"points3d_{self._frame_id}.xyz"
+        np.savetxt(xyz_path, points3d_array.reshape(-1, 6), fmt='%f', delimiter=' ')
+        # construct 3d point cloud from distance, azimuth, elevation for visualization purposes
+        x = distance * np.cos(np.radians(elevation)) * np.cos(np.radians(azimuth))
+        y = distance * np.cos(np.radians(elevation)) * np.sin(np.radians(azimuth))
+        z = distance * np.sin(np.radians(elevation))
+        point_cloud_array = np.stack((x, y, z), axis=-1)
+        point_cloud_path = SAVE_PATH / f"point_cloud_{self._frame_id}.xyz"
+        np.savetxt(point_cloud_path, point_cloud_array.reshape(-1, 3), fmt='%f', delimiter=' ')
+        # Save a a 2D image of the distance and intensity for the first frame for visualization purposes
+        # Distance
+        distance_image_path = SAVE_PATH / f"distance_{self._frame_id}.png"
+        self._save_image(distance_image_path, distance)
+        # Intensity
+        intensity_image_path = SAVE_PATH / f"intensity_{self._frame_id}.png"
+        self._save_image(intensity_image_path, intensity)

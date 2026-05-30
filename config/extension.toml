@@ -9,10 +9,10 @@
 # its affiliates is strictly prohibited.
 
 [package]
-title = "RTX Lidar Depth Reader"
+title = "Ouster Lidar RTX"
 version = "1.0.0"  # Semantic Versioning is used: https://semver.org/
-description = "The simplest python extension example. Use it as a starting point for your extensions."
-category = "Example"  # How to categorize this in the Extension Manager
+description = "An extension by Ouster which enables virtual sensor through IsaacSim."
+category = "Virtual Sensor"  # How to categorize this in the Extension Manager
 changelog = "docs/CHANGELOG.md"
 icon = "data/icon.png"  # Icon to show in the Extension Manager
 keywords = ["kit", "example", "extension"]  # Search keywords for the Extension Manager
@@ -31,8 +31,8 @@ repository = "https://github.com/NVIDIA-Omniverse/kit-app-template"  # URL of th
 [settings]
 
 
-[[python.module]]  # Main python module this extension provides, it will be publicly available as "import my_company.lidar_reader"
-name = "my_company.lidar_reader"
+[[python.module]]  # Main python module this extension provides, it will be publicly available as "import ouster.rtx_lidar"
+name = "ouster.rtx_lidar"
 
 
 [documentation]

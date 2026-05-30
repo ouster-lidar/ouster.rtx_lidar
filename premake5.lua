@@ -7,5 +7,5 @@ project_ext (ext)
 repo_build.prebuild_link {
     { "data", ext.target_dir.."/data" },
     { "docs", ext.target_dir.."/docs" },
-    { "my_company", ext.target_dir.."/my_company" },
+    { "ouster", ext.target_dir.."/ouster" },
 }

@@ -1,3 +1,3 @@
-# RTX Lidar Depth Reader [my_company.lidar_reader]
+# Ouster RTX Lidar [ouster.rtx_lidar]
 
-This is an example of pure python Kit extension. It is intended to be copied and to serve as a template to create new ones.
+A virtual Ouster using IsaacSim as the backend
