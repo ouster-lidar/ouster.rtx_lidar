@@ -960,7 +960,6 @@ class ExistingLidarReader(omni.ext.IExt):
         self._session_active = False
         self._frame_id = 0
         self._pkt_count = 0
-        self._writer = None
         self._scan = None
         self._scan_range_m = None
         self._scan_intensity = None
@@ -1000,14 +999,6 @@ class ExistingLidarReader(omni.ext.IExt):
         if self._session_active or self._is_shutting_down:
             return
 
-        self._writer = Writer(
-            "/home/unaal/nvidia/isaac-sim-ext/lidar_capture.osf",
-            self._sensor_info)
-
-        field_types = [
-            FieldType(ChanField.RANGE, np.uint32, (), FieldClass.PIXEL_FIELD),
-            FieldType(ChanField.REFLECTIVITY, np.uint8, (), FieldClass.PIXEL_FIELD)
-        ]
         self._scan = LidarScan(self._sensor_info)
         self._frame_id = 0
         self._pkt_count = 0
@@ -1042,13 +1033,6 @@ class ExistingLidarReader(omni.ext.IExt):
         print("[ExistingLidarReader] Streaming session started")
 
     def _stop_session(self):
-        if not self._session_active and self._writer is None and self._sock_lidar is None:
-            return
-
-        if self._writer is not None:
-            self._writer.close()
-            self._writer = None
-
         self._scan = None
         self._scan_range_m = None
         self._scan_intensity = None
@@ -1263,8 +1247,6 @@ class ExistingLidarReader(omni.ext.IExt):
         self._scan.status[:] = 0x1
         packet_count = len(self._scan.packet_timestamp)
         self._scan.packet_timestamp[:] = timestamps[np.arange(packet_count) * 16]
-
-        # self._writer.save(0, self._scan, int(time.time() * 1e9))  # Save with current timestamp in nanoseconds
 
         packets = scan_to_packets(self._scan, self.sensor_info)
         self._enqueue_packets(packets)
