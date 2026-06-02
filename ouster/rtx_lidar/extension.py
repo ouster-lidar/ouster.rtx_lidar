@@ -1008,7 +1008,7 @@ class ExistingLidarReader(omni.ext.IExt):
         self._packet_sender_stop = threading.Event()
 
         if self._http_server is None:
-            self._http_server = HttpServer(self, "127.0.0.1", 7070, autostart=False)
+            self._http_server = HttpServer(self, "0.0.0.0", 7070, autostart=False)
         self._http_server.start()
 
         initialized = False
@@ -1090,9 +1090,8 @@ class ExistingLidarReader(omni.ext.IExt):
             outputAzimuth=True,
             outputElevation=True
         )
-
-        # 3. Attach and let Replicator build the graph
         self.annotator.attach([self.render_product_path])
+
         await rep.orchestrator.step_async()
 
         if self._is_shutting_down:
@@ -1194,11 +1193,15 @@ class ExistingLidarReader(omni.ext.IExt):
                 if self._packet_sender_stop.is_set():
                     break
 
+            udp_dest = self._sensor_info.config.udp_dest
+            udp_port_lidar = self._sensor_info.config.udp_port_lidar
+            udp_port_imu = self._sensor_info.config.udp_port_imu
+
             try:
                 if packet_type == PacketType.Lidar:
-                    self._sock_lidar.sendto(payload, ("127.0.0.1", 7502))
+                    self._sock_lidar.sendto(payload, (udp_dest, udp_port_lidar))
                 elif packet_type == PacketType.Imu:
-                    self._sock_imu.sendto(payload, ("127.0.0.1", 7503))
+                    self._sock_imu.sendto(payload, (udp_dest, udp_port_imu))
                 self._pkt_count += 1
             except OSError:
                 break
@@ -1253,7 +1256,8 @@ class ExistingLidarReader(omni.ext.IExt):
         queued = self._packet_queue.qsize() if self._packet_queue is not None else 0
         print(
             f"[ExistingLidarReader] Queued {len(packets)} packets for frame "
-            f"{self._frame_id} (queued: {queued}, sent: {self._pkt_count})"
+            f"{self._frame_id} (queued: {queued}, sent: {self._pkt_count}) -> udp_dest: {self._sensor_info.config.udp_dest}, "
+            f"udp_port_lidar: {self._sensor_info.config.udp_port_lidar}, udp_port_imu: {self._sensor_info.config.udp_port_imu}"
         )
 
     def on_shutdown(self):
