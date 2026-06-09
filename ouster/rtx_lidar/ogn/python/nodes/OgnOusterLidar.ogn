@@ -1,0 +1,95 @@
+{
+    "OgnOusterLidar": {
+        "version": 1,
+        "description": "Ouster RTX Lidar streaming node. Reads the RTX lidar sensor output, converts it to Ouster SDK format, and streams UDP packets to an Ouster client.",
+        "language": "Python",
+        "categories": ["isaacSensor"],
+        "metadata": {
+            "uiName": "Ouster RTX Lidar"
+        },
+        "inputs": {
+            "execIn": {
+                "type": "execution",
+                "description": "Execution input - connect to OnPlaybackTick or OnTick"
+            },
+            "sensorPath": {
+                "type": "string",
+                "description": "USD path to the RTX Lidar sensor prim in the stage",
+                "default": "/World/OS0_REV7_128_10hz___1024_resolution/sensor",
+                "metadata": {
+                    "uiName": "Sensor Prim Path"
+                }
+            },
+            "lidarConfigPath": {
+                "type": "string",
+                "description": "Path to the RTX Lidar JSON configuration file",
+                "default": "",
+                "metadata": {
+                    "uiName": "Lidar Config File"
+                }
+            },
+            "udpDest": {
+                "type": "string",
+                "description": "UDP destination address for lidar/IMU packets",
+                "default": "127.0.0.1",
+                "metadata": {
+                    "uiName": "UDP Destination"
+                }
+            },
+            "udpPortLidar": {
+                "type": "int",
+                "description": "UDP port for lidar data packets",
+                "default": 7502,
+                "metadata": {
+                    "uiName": "UDP Port (Lidar)"
+                }
+            },
+            "udpPortImu": {
+                "type": "int",
+                "description": "UDP port for IMU data packets",
+                "default": 7503,
+                "metadata": {
+                    "uiName": "UDP Port (IMU)"
+                }
+            },
+            "httpPort": {
+                "type": "int",
+                "description": "HTTP server port for the sensor metadata API",
+                "default": 7070,
+                "metadata": {
+                    "uiName": "HTTP Port"
+                }
+            },
+            "enabled": {
+                "type": "bool",
+                "description": "Enable or disable UDP streaming",
+                "default": true,
+                "metadata": {
+                    "uiName": "Enabled"
+                }
+            }
+        },
+        "outputs": {
+            "execOut": {
+                "type": "execution",
+                "description": "Execution output"
+            },
+            "frameId": {
+                "type": "int64",
+                "description": "Current frame ID being streamed",
+                "default": 0,
+                "metadata": {
+                    "uiName": "Frame ID"
+                }
+            },
+            "packetsSent": {
+                "type": "int64",
+                "description": "Total number of UDP packets sent",
+                "default": 0,
+                "metadata": {
+                    "uiName": "Packets Sent"
+                }
+            }
+        }
+    }
+}

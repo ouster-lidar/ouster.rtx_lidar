@@ -1,12 +1,7 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+# SPDX-FileCopyrightText: Copyright (c) 2026 Ouster Inc. All rights reserved.
+# SPDX-License-Identifier: TBD
 #
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# redistribution without permission is strictly prohibited.
 
 [package]
 title = "Ouster Lidar RTX"
@@ -15,10 +10,10 @@ description = "An extension by Ouster which enables virtual sensor through Isaac
 category = "Virtual Sensor"  # How to categorize this in the Extension Manager
 changelog = "docs/CHANGELOG.md"
 icon = "data/icon.png"  # Icon to show in the Extension Manager
-keywords = ["kit", "example", "extension"]  # Search keywords for the Extension Manager
+keywords = ["ouster", "lidar", "extension"]  # Search keywords for the Extension Manager
 preview_image = "data/preview.png"  # Preview to show in the Extension Manager
 readme  = "docs/README.md"  # Path (relative to the root) or content of readme markdown file for UI
-repository = "https://github.com/NVIDIA-Omniverse/kit-app-template"  # URL of the extension source repository
+repository = "https://github.com/ouster-isaacsim-ext"  # URL of the extension source repository
 
 
 [dependencies]
@@ -26,13 +21,25 @@ repository = "https://github.com/NVIDIA-Omniverse/kit-app-template"  # URL of th
 "omni.replicator.core" = {}
 "isaacsim.sensors.rtx" = {}
 "omni.sensors.nv.lidar" = {}
-# "omni.usd.schema.omni_sensors" = {} # Add this! It gives us the USD schemas for Lidar
+"omni.graph.core" = {}
+"omni.graph.tools" = {}
 
 [settings]
+
+# Watch the .ogn files for hot reloading (only works for Python files)
+[fswatcher.patterns]
+include = ["*.ogn", "*.py"]
+exclude = ["Ogn*Database.py"]
 
 
 [[python.module]]  # Main python module this extension provides, it will be publicly available as "import ouster.rtx_lidar"
 name = "ouster.rtx_lidar"
+
+
+[python.pip]
+requirements = [
+    "ouster.sdk==0.16.1"
+]
 
 
 [documentation]
