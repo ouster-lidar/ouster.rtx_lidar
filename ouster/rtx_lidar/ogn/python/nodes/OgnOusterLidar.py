@@ -412,7 +412,6 @@ class OgnOusterLidar:
                     ))
 
         db.outputs.frameId = state.frame_id
-        db.outputs.packetsSent = state.pkt_count
         db.outputs.execOut = og.ExecutionAttributeState.ENABLED
         return True
 

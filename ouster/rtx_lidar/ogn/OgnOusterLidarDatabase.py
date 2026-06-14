@@ -31,7 +31,6 @@ class OgnOusterLidarDatabase(og.Database):
         Outputs:
             outputs.execOut
             outputs.frameId
-            outputs.packetsSent
     """
 
     GENERATOR_VERSION = (1, 79, 2)
@@ -46,11 +45,10 @@ class OgnOusterLidarDatabase(og.Database):
         ('inputs:udpDest', 'string', 0, 'UDP Destination', 'UDP destination address for lidar/IMU packets', {ogn.MetadataKeys.DEFAULT: '"127.0.0.1"'}, True, "127.0.0.1", False, ''),
         ('inputs:udpPortLidar', 'int', 0, 'UDP Port (Lidar)', 'UDP port for lidar data packets', {ogn.MetadataKeys.DEFAULT: '7502'}, True, 7502, False, ''),
         ('inputs:udpPortImu', 'int', 0, 'UDP Port (IMU)', 'UDP port for IMU data packets', {ogn.MetadataKeys.DEFAULT: '7503'}, True, 7503, False, ''),
-        ('inputs:httpPort', 'int', 0, 'HTTP Port', 'HTTP server port for the sensor metadata API', {ogn.MetadataKeys.DEFAULT: '7070'}, True, 7070, False, ''),
+        ('inputs:httpPort', 'int', 0, 'HTTP Port', 'HTTP server port for the sensor metadata API', {ogn.MetadataKeys.DEFAULT: '8080'}, True, 8080, False, ''),
         ('inputs:enabled', 'bool', 0, 'Enabled', 'Enable or disable UDP streaming', {ogn.MetadataKeys.DEFAULT: 'true'}, True, True, False, ''),
         ('outputs:execOut', 'execution', 0, None, 'Execution output', {}, True, None, False, ''),
         ('outputs:frameId', 'int64', 0, 'Frame ID', 'Current frame ID being streamed', {ogn.MetadataKeys.DEFAULT: '0'}, True, 0, False, ''),
-        ('outputs:packetsSent', 'int64', 0, 'Packets Sent', 'Total number of UDP packets sent', {ogn.MetadataKeys.DEFAULT: '0'}, True, 0, False, ''),
     ])
 
     @classmethod
@@ -88,7 +86,7 @@ class OgnOusterLidarDatabase(og.Database):
                 "127.0.0.1",
                 7502,
                 7503,
-                7070,
+                8080,
                 True,
             ]
 
@@ -175,7 +173,7 @@ class OgnOusterLidarDatabase(og.Database):
                 self._batchedReadValues = newValues
 
     class ValuesForOutputs(og.DynamicAttributeAccess):
-        LOCAL_PROPERTY_NAMES = {"execOut", "frameId", "packetsSent", "_batchedWriteValues"}
+        LOCAL_PROPERTY_NAMES = {"execOut", "frameId", "_batchedWriteValues"}
 
         def __init__(self, node: og.Node, attributes, dynamic_attributes: og.DynamicAttributeInterface):
             context = node.get_graph().get_default_graph_context()
@@ -207,19 +205,6 @@ class OgnOusterLidarDatabase(og.Database):
         @frameId.setter
         def frameId(self, value):
             self._batchedWriteValues[self._attributes.frameId] = value
-
-        @property
-        def packetsSent(self):
-            value = self._batchedWriteValues.get(self._attributes.packetsSent)
-            if value:
-                return value
-            else:
-                data_view = og.AttributeValueHelper(self._attributes.packetsSent)
-                return data_view.get()
-
-        @packetsSent.setter
-        def packetsSent(self, value):
-            self._batchedWriteValues[self._attributes.packetsSent] = value
 
         def __getattr__(self, item: str):
             if item in self.LOCAL_PROPERTY_NAMES:

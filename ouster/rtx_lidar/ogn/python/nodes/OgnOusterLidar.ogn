@@ -55,7 +55,7 @@
             "httpPort": {
                 "type": "int",
                 "description": "HTTP server port for the sensor metadata API",
-                "default": 7070,
+                "default": 8080,
                 "metadata": {
                     "uiName": "HTTP Port"
                 }
@@ -80,14 +80,6 @@
                 "default": 0,
                 "metadata": {
                     "uiName": "Frame ID"
-                }
-            },
-            "packetsSent": {
-                "type": "int64",
-                "description": "Total number of UDP packets sent",
-                "default": 0,
-                "metadata": {
-                    "uiName": "Packets Sent"
                 }
             }
         }
