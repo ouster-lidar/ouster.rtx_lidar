@@ -40,8 +40,9 @@ class OgnOusterLidarDatabase(og.Database):
 
     INTERFACE = og.Database._get_interface([
         ('inputs:execIn', 'execution', 0, None, 'Execution input - connect to OnPlaybackTick or OnTick', {ogn.MetadataKeys.DEFAULT: '0'}, True, 0, False, ''),
-        ('inputs:sensorPath', 'string', 0, 'Sensor Prim Path', 'USD path to the RTX Lidar sensor prim in the stage', {ogn.MetadataKeys.DEFAULT: '"/World/OS0_REV7_128_10hz___1024_resolution/sensor"'}, True, "/World/OS0_REV7_128_10hz___1024_resolution/sensor", False, ''),
-        ('inputs:sensorVariant', 'string', 0, 'Sensor Variant', 'Path to the RTX Lidar JSON configuration file', {ogn.MetadataKeys.DEFAULT: '""'}, True, "", False, ''),
+        ('inputs:sensorPath', 'string', 0, 'Sensor Prim Path', 'USD path to the RTX Lidar sensor prim in the stage', {ogn.MetadataKeys.DEFAULT: '""'}, True, "", False, ''),
+        ('inputs:sensorVariant', 'string', 0, 'Sensor Variant (optional)', 'Ouster sensor variant name (e.g. OS0_REV7_128ch10hz1024res).' 
+         'If empty, auto-read from the sensorModelConfig attribute on the sensor prim.', {ogn.MetadataKeys.DEFAULT: '""'}, True, "", False, ''),
         ('inputs:udpDest', 'string', 0, 'UDP Destination', 'UDP destination address for lidar/IMU packets', {ogn.MetadataKeys.DEFAULT: '"127.0.0.1"'}, True, "127.0.0.1", False, ''),
         ('inputs:udpPortLidar', 'int', 0, 'UDP Port (Lidar)', 'UDP port for lidar data packets', {ogn.MetadataKeys.DEFAULT: '7502'}, True, 7502, False, ''),
         ('inputs:udpPortImu', 'int', 0, 'UDP Port (IMU)', 'UDP port for IMU data packets', {ogn.MetadataKeys.DEFAULT: '7503'}, True, 7503, False, ''),
@@ -81,7 +82,7 @@ class OgnOusterLidarDatabase(og.Database):
             ]
             self._batchedReadValues = [
                 0,
-                "/World/OS0_REV7_128_10hz___1024_resolution/sensor",
+                "",
                 "",
                 "127.0.0.1",
                 7502,

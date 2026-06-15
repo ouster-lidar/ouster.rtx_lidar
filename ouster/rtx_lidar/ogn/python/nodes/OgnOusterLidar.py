@@ -81,12 +81,36 @@ class OgnOusterLidar:
         return OgnOusterLidarInternalState()
 
     @staticmethod
+    def _read_sensor_variant_from_prim(sensor_path):
+        """Read the sensorModelConfig attribute from the sensor prim on the USD stage."""
+        import omni.usd
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            print("No USD stage found, cannot read sensor variant")
+            return None
+        prim = stage.GetPrimAtPath(sensor_path)
+        if prim.IsValid():
+            variant_sets = prim.GetVariantSets()
+            if variant_sets.HasVariantSet("sensor"):
+                sensor_variant_set = variant_sets.GetVariantSet("sensor")
+                return sensor_variant_set.GetVariantSelection()
+
+        print("Variant set 'sensor' not found on this prim.")
+        return None
+
+    @staticmethod
     def _compose_sensor_info(lidar_sensor_variant, udp_port_lidar, udp_port_imu, udp_dest):
         """Build a SensorInfo from an RTX lidar config JSON file."""
         ext_manager = omni.kit.app.get_app_interface().get_extension_manager()
         ext_id = ext_manager.get_enabled_extension_id("isaacsim.sensors.rtx")
         isaac_sim_ext_path = ext_manager.get_extension_path(ext_id)
-        lidar_config_path = f"{isaac_sim_ext_path}/data/lidar_configs/Ouster/OS0/{lidar_sensor_variant}.json"
+        # Derive sensor family (OS0, OS1, OS2) from variant name prefix
+        sensor_family = "OS0"  # default
+        for prefix in ("OS0", "OS1", "OS2"):
+            if lidar_sensor_variant.startswith(prefix):
+                sensor_family = prefix
+                break
+        lidar_config_path = f"{isaac_sim_ext_path}/data/lidar_configs/Ouster/{sensor_family}/{lidar_sensor_variant}.json"
         print(f"Loading lidar config from {lidar_config_path}")
         with open(lidar_config_path, "r") as f:
             lidar_cfg = json.load(f)
@@ -158,8 +182,7 @@ class OgnOusterLidar:
     def _setup_pipeline(state, sensor_path):
         """Create Render Product and annotator for the given sensor path."""
         state.render_product = rep.create.render_product(
-            sensor_path,
-            [1, 1],
+            f"{sensor_path}/sensor", [1, 1],
             name="OgnOusterLidarRenderProduct",
             render_vars=["GenericModelOutput", "RtxSensorMetadata"],
         )
@@ -327,10 +350,18 @@ class OgnOusterLidar:
         http_port = db.inputs.httpPort
         enabled = db.inputs.enabled
 
-        if not sensor_path or not sensor_variant:
+        if not sensor_path:
             db.outputs.execOut = og.ExecutionAttributeState.DISABLED
-            print("OgnOusterLidar: Missing sensor path or variant config, disabling execution")
+            print("OgnOusterLidar: Missing sensor path, disabling execution")
             return False
+
+        # Auto-resolve sensor variant from prim if not explicitly set
+        if not sensor_variant:
+            sensor_variant = OgnOusterLidar._read_sensor_variant_from_prim(sensor_path)
+            if not sensor_variant:
+                db.outputs.execOut = og.ExecutionAttributeState.DISABLED
+                print(f"OgnOusterLidar: Could not read sensorModelConfig from prim '{sensor_path}'")
+                return False
 
         # Initialize or reinitialize if config changed
         if not state.initialized or state.needs_reinit(

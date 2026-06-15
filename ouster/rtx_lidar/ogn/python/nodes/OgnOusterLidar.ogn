@@ -15,17 +15,17 @@
             "sensorPath": {
                 "type": "string",
                 "description": "USD path to the RTX Lidar sensor prim in the stage",
-                "default": "/World/OS0_REV7_128_10hz___1024_resolution/sensor",
+                "default": "",
                 "metadata": {
                     "uiName": "Sensor Prim Path"
                 }
             },
             "sensorVariant": {
                 "type": "string",
-                "description": "Path to the RTX Lidar JSON configuration file",
+                "description": "Ouster sensor variant name (e.g. OS0_REV7_128ch10hz1024res). If empty, auto-read from the sensorModelConfig attribute on the sensor prim.",
                 "default": "",
                 "metadata": {
-                    "uiName": "Sensor Variant"
+                    "uiName": "Sensor Variant (optional)"
                 }
             },
             "udpDest": {
