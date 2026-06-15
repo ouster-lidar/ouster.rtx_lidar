@@ -20,12 +20,12 @@
                     "uiName": "Sensor Prim Path"
                 }
             },
-            "lidarConfigPath": {
+            "sensorVariant": {
                 "type": "string",
                 "description": "Path to the RTX Lidar JSON configuration file",
                 "default": "",
                 "metadata": {
-                    "uiName": "Lidar Config File"
+                    "uiName": "Sensor Variant"
                 }
             },
             "udpDest": {

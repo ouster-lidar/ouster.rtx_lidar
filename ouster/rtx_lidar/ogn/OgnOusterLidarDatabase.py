@@ -22,7 +22,7 @@ class OgnOusterLidarDatabase(og.Database):
         Inputs:
             inputs.execIn
             inputs.sensorPath
-            inputs.lidarConfigPath
+            inputs.sensorVariant
             inputs.udpDest
             inputs.udpPortLidar
             inputs.udpPortImu
@@ -41,7 +41,7 @@ class OgnOusterLidarDatabase(og.Database):
     INTERFACE = og.Database._get_interface([
         ('inputs:execIn', 'execution', 0, None, 'Execution input - connect to OnPlaybackTick or OnTick', {ogn.MetadataKeys.DEFAULT: '0'}, True, 0, False, ''),
         ('inputs:sensorPath', 'string', 0, 'Sensor Prim Path', 'USD path to the RTX Lidar sensor prim in the stage', {ogn.MetadataKeys.DEFAULT: '"/World/OS0_REV7_128_10hz___1024_resolution/sensor"'}, True, "/World/OS0_REV7_128_10hz___1024_resolution/sensor", False, ''),
-        ('inputs:lidarConfigPath', 'string', 0, 'Lidar Config File', 'Path to the RTX Lidar JSON configuration file', {ogn.MetadataKeys.DEFAULT: '""'}, True, "", False, ''),
+        ('inputs:sensorVariant', 'string', 0, 'Sensor Variant', 'Path to the RTX Lidar JSON configuration file', {ogn.MetadataKeys.DEFAULT: '""'}, True, "", False, ''),
         ('inputs:udpDest', 'string', 0, 'UDP Destination', 'UDP destination address for lidar/IMU packets', {ogn.MetadataKeys.DEFAULT: '"127.0.0.1"'}, True, "127.0.0.1", False, ''),
         ('inputs:udpPortLidar', 'int', 0, 'UDP Port (Lidar)', 'UDP port for lidar data packets', {ogn.MetadataKeys.DEFAULT: '7502'}, True, 7502, False, ''),
         ('inputs:udpPortImu', 'int', 0, 'UDP Port (IMU)', 'UDP port for IMU data packets', {ogn.MetadataKeys.DEFAULT: '7503'}, True, 7503, False, ''),
@@ -61,7 +61,7 @@ class OgnOusterLidarDatabase(og.Database):
 
     class ValuesForInputs(og.DynamicAttributeAccess):
         LOCAL_PROPERTY_NAMES = {
-            "execIn", "sensorPath", "lidarConfigPath", "udpDest",
+            "execIn", "sensorPath", "sensorVariant", "udpDest",
             "udpPortLidar", "udpPortImu", "httpPort", "enabled",
             "_setting_locked", "_batchedReadAttributes", "_batchedReadValues"
         }
@@ -72,7 +72,7 @@ class OgnOusterLidarDatabase(og.Database):
             self._batchedReadAttributes = [
                 self._attributes.execIn,
                 self._attributes.sensorPath,
-                self._attributes.lidarConfigPath,
+                self._attributes.sensorVariant,
                 self._attributes.udpDest,
                 self._attributes.udpPortLidar,
                 self._attributes.udpPortImu,
@@ -107,11 +107,11 @@ class OgnOusterLidarDatabase(og.Database):
             self._batchedReadValues[1] = value
 
         @property
-        def lidarConfigPath(self):
+        def sensorVariant(self):
             return self._batchedReadValues[2]
 
-        @lidarConfigPath.setter
-        def lidarConfigPath(self, value):
+        @sensorVariant.setter
+        def sensorVariant(self, value):
             self._batchedReadValues[2] = value
 
         @property

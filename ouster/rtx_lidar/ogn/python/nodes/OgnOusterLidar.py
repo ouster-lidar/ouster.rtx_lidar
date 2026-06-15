@@ -43,17 +43,17 @@ class OgnOusterLidarInternalState:
         self.max_returns = 1
         # Track last config to detect changes
         self._last_sensor_path = None
-        self._last_config_path = None
+        self._last_sensor_variant = None
         self._last_udp_dest = None
         self._last_udp_port_lidar = None
         self._last_udp_port_imu = None
         self._last_http_port = None
         self._last_enabled = None
 
-    def needs_reinit(self, sensor_path, config_path, udp_dest, udp_port_lidar, udp_port_imu, http_port, enabled):
+    def needs_reinit(self, sensor_path, sensor_variant, udp_dest, udp_port_lidar, udp_port_imu, http_port, enabled):
         """Check if any configuration changed that requires reinitialization."""
         return (self._last_sensor_path != sensor_path or
-                self._last_config_path != config_path or
+                self._last_sensor_variant != sensor_variant or
                 self._last_udp_port_lidar != udp_port_lidar or
                 self._last_udp_port_imu != udp_port_imu or
                 self._last_http_port != http_port)
@@ -63,9 +63,9 @@ class OgnOusterLidarInternalState:
         return (self._last_udp_dest != udp_dest or
                 self._last_enabled != enabled)
 
-    def save_config(self, sensor_path, config_path, udp_dest, udp_port_lidar, udp_port_imu, http_port, enabled):
+    def save_config(self, sensor_path, sensor_variant, udp_dest, udp_port_lidar, udp_port_imu, http_port, enabled):
         self._last_sensor_path = sensor_path
-        self._last_config_path = config_path
+        self._last_sensor_variant = sensor_variant
         self._last_udp_dest = udp_dest
         self._last_udp_port_lidar = udp_port_lidar
         self._last_udp_port_imu = udp_port_imu
@@ -81,8 +81,13 @@ class OgnOusterLidar:
         return OgnOusterLidarInternalState()
 
     @staticmethod
-    def _compose_sensor_info(lidar_config_path, udp_port_lidar, udp_port_imu, udp_dest):
+    def _compose_sensor_info(lidar_sensor_variant, udp_port_lidar, udp_port_imu, udp_dest):
         """Build a SensorInfo from an RTX lidar config JSON file."""
+        ext_manager = omni.kit.app.get_app_interface().get_extension_manager()
+        ext_id = ext_manager.get_enabled_extension_id("isaacsim.sensors.rtx")
+        isaac_sim_ext_path = ext_manager.get_extension_path(ext_id)
+        lidar_config_path = f"{isaac_sim_ext_path}/data/lidar_configs/Ouster/OS0/{lidar_sensor_variant}.json"
+        print(f"Loading lidar config from {lidar_config_path}")
         with open(lidar_config_path, "r") as f:
             lidar_cfg = json.load(f)
         lidar_cfg = lidar_cfg["profile"]
@@ -315,20 +320,21 @@ class OgnOusterLidar:
             per_node_data["state"] = state
 
         sensor_path = db.inputs.sensorPath
-        config_path = db.inputs.lidarConfigPath
+        sensor_variant = db.inputs.sensorVariant
         udp_dest = db.inputs.udpDest
         udp_port_lidar = db.inputs.udpPortLidar
         udp_port_imu = db.inputs.udpPortImu
         http_port = db.inputs.httpPort
         enabled = db.inputs.enabled
 
-        if not sensor_path or not config_path:
+        if not sensor_path or not sensor_variant:
             db.outputs.execOut = og.ExecutionAttributeState.DISABLED
+            print("OgnOusterLidar: Missing sensor path or variant config, disabling execution")
             return False
 
         # Initialize or reinitialize if config changed
         if not state.initialized or state.needs_reinit(
-                sensor_path, config_path, udp_dest, udp_port_lidar, udp_port_imu, http_port, enabled):
+                sensor_path, sensor_variant, udp_dest, udp_port_lidar, udp_port_imu, http_port, enabled):
             # Tear down existing
             if state.initialized:
                 OgnOusterLidar._stop_streaming(state)
@@ -336,7 +342,7 @@ class OgnOusterLidar:
 
             try:
                 state.sensor_info, state.max_returns = OgnOusterLidar._compose_sensor_info(
-                    config_path, udp_port_lidar, udp_port_imu, udp_dest)
+                    sensor_variant, udp_port_lidar, udp_port_imu, udp_dest)
             except Exception as error:
                 db.log_error(f"Failed to load lidar config: {error}")
                 db.outputs.execOut = og.ExecutionAttributeState.DISABLED
@@ -352,7 +358,7 @@ class OgnOusterLidar:
                 OgnOusterLidar._start_streaming(state, udp_dest, udp_port_lidar, udp_port_imu, http_port)
 
             state.initialized = True
-            state.save_config(sensor_path, config_path, udp_dest, udp_port_lidar, udp_port_imu, http_port, enabled)
+            state.save_config(sensor_path, sensor_variant, udp_dest, udp_port_lidar, udp_port_imu, http_port, enabled)
 
         # Handle runtime changes (enable/disable, udp_dest change)
         if state.config_changed_runtime(udp_dest, enabled):
@@ -362,7 +368,7 @@ class OgnOusterLidar:
                 OgnOusterLidar._start_streaming(state, udp_dest, udp_port_lidar, udp_port_imu, http_port)
             if state.sensor_info is not None:
                 state.sensor_info.config.udp_dest = udp_dest
-            state.save_config(sensor_path, config_path, udp_dest, udp_port_lidar, udp_port_imu, http_port, enabled)
+            state.save_config(sensor_path, sensor_variant, udp_dest, udp_port_lidar, udp_port_imu, http_port, enabled)
 
         # Process frame if enabled
         if not enabled or state.annotator is None:
