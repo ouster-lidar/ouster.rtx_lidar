@@ -1,6 +1,6 @@
 {
     "OgnOusterLidar": {
-        "version": 1,
+        "version": 2,
         "description": "Ouster RTX Lidar streaming node. Reads the RTX lidar sensor output, converts it to Ouster SDK format, and streams UDP packets to an Ouster client.",
         "language": "Python",
         "categories": ["isaacSensor"],
@@ -28,6 +28,22 @@
                     "uiName": "Sensor Variant (optional)"
                 }
             },
+            "httpAddr": {
+                "type": "string",
+                "description": "Bind address for the HTTP metadata server. Use 0.0.0.0 to listen on all interfaces (required for Detect/Catalyst to reach it), or 127.0.0.1 for loopback-only testing.",
+                "default": "0.0.0.0",
+                "metadata": {
+                    "uiName": "HTTP Bind Address"
+                }
+            },
+            "httpPort": {
+                "type": "int",
+                "description": "HTTP server port for the sensor metadata API",
+                "default": 8080,
+                "metadata": {
+                    "uiName": "HTTP Port"
+                }
+            },
             "udpDest": {
                 "type": "string",
                 "description": "UDP destination address for lidar/IMU packets",
@@ -52,14 +68,6 @@
                     "uiName": "UDP Port (IMU)"
                 }
             },
-            "httpPort": {
-                "type": "int",
-                "description": "HTTP server port for the sensor metadata API",
-                "default": 8080,
-                "metadata": {
-                    "uiName": "HTTP Port"
-                }
-            },
             "enabled": {
                 "type": "bool",
                 "description": "Enable or disable UDP streaming",
@@ -80,6 +88,38 @@
                 "default": 0,
                 "metadata": {
                     "uiName": "Frame ID"
+                }
+            },
+            "httpBoundAddr": {
+                "type": "string",
+                "description": "Actual address:port the HTTP server bound to, or empty/error text if bind failed",
+                "default": "",
+                "metadata": {
+                    "uiName": "HTTP Bound Address"
+                }
+            },
+            "lastClientAddr": {
+                "type": "string",
+                "description": "Remote IP of the last client that hit the sensor config/metadata API (should be the Detect edge processor IP once discovered)",
+                "default": "",
+                "metadata": {
+                    "uiName": "Last HTTP Client"
+                }
+            },
+            "packetsSent": {
+                "type": "int64",
+                "description": "Cumulative UDP packets (lidar+IMU) sent since streaming started",
+                "default": 0,
+                "metadata": {
+                    "uiName": "Packets Sent"
+                }
+            },
+            "httpServerError": {
+                "type": "string",
+                "description": "Last HTTP server startup error, if any. Empty means no error.",
+                "default": "",
+                "metadata": {
+                    "uiName": "HTTP Server Error"
                 }
             }
         }
