@@ -237,9 +237,10 @@ class OgnOusterLidar:
         except Exception as e:
             state.http_server = None
             state.http_server_error = f"{type(e).__name__}: {e}"
-            # HTTP bind failed. UDP sockets are intentionally not created:
-            # the node stays enabled and will retry on the next compute()
-            # if the input config changes (needs_reinit picks it up).
+            # HTTP bind failed. UDP sockets are intentionally not created.
+            # Ensure we don't enqueue packets while streaming isn't running.
+            state.packet_queue = None
+            state.packet_sender_stop = None
             return
 
         state.sock_lidar = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
