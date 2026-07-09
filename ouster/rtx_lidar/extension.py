@@ -167,6 +167,8 @@ class HttpServer():
         self._flask_thread = None
         self._waitress_server = None
         self._autostart = autostart
+        self.last_client_addr = ""
+        self.bind_error = ""
 
         def _sensor_info_as_json(sensor_info):
             sensor_info_json = json.loads(sensor_info.to_json_string())
@@ -232,6 +234,7 @@ class HttpServer():
         @app.route('/api/v1/sensor/cmd/set_udp_dest_auto', methods=['GET'])
         def set_udp_dest_auto():
             self._sensor.sensor_info.config.udp_dest = request.remote_addr
+            self.last_client_addr = request.remote_addr
             return "{}"
 
         @app.route('/api/v1/sensor/cmd/set_config_param', methods=['GET', 'POST', 'DELETE'])
@@ -247,6 +250,7 @@ class HttpServer():
                     "title": "500 Internal Server Error",
                     "description": "Command \"set_config_param\" failed: error: Expected 1-2 arguments"}})
             self.configure_sensor(sensor_config, request.remote_addr)
+            self.last_client_addr = request.remote_addr
             return "\"set_config_param\""
 
         @app.route('/api/v1/user/data', methods=['GET', 'PUT', 'DELETE'])
@@ -314,13 +318,11 @@ class HttpServer():
             })
             return response
 
-        # --- DÉBUT DES MODIFICATIONS : GESTION DES ALERTES VIRTUELLES ---
         self.active_alerts = []
         self.alert_cursor = 0
 
         @app.route('/api/v1/sensor/alerts', methods=['GET'])
         def get_sensor_alerts():
-            """L'endpoint officiel que le SDK ou ROS interroge"""
             return jsonify({
                 "active": self.active_alerts,
                 "log": [],
@@ -329,7 +331,6 @@ class HttpServer():
 
         @app.route('/api/v1/dev/inject_alert', methods=['POST'])
         def inject_alert():
-            """Notre backdoor pour créer une alerte sur demande"""
             data = request.json or {}
             new_alert = {
                 "active": True,
@@ -339,7 +340,7 @@ class HttpServer():
                 "level": data.get("level", "WARNING"),
                 "msg": data.get("msg", "Alerte générée par le replay"),
                 "msg_verbose": data.get("msg_verbose", "Détails de l'alerte virtuelle"),
-                "realtime": str(int(time.time() * 1e9)) # Temps en nanosecondes
+                "realtime": str(int(time.time() * 1e9))
             }
             self.active_alerts.append(new_alert)
             self.alert_cursor += 1
@@ -347,10 +348,8 @@ class HttpServer():
 
         @app.route('/api/v1/dev/clear_alerts', methods=['POST'])
         def clear_alerts():
-            """Pour simuler un retour à la normale"""
             self.active_alerts = []
             return jsonify({"status": "cleared"}), 200
-        # --- FIN DES MODIFICATIONS ---
 
         def tab_title(tab):
             return f"os-{self._sensor.sensor_info.sn} :: {tab} :: Ouster"
@@ -375,7 +374,7 @@ class HttpServer():
 
             system_status = {
                 'State': self._sensor.sensor_info.config.operating_mode.name,
-                'Active Alerts': str(len(self.active_alerts)) # MODIFIÉ ICI
+                'Active Alerts': str(len(self.active_alerts))
             }
 
             configuration = {
@@ -394,7 +393,6 @@ class HttpServer():
 
         @app.route('/diag')
         def diagnostics():
-            # MODIFIÉ ICI
             return render_template('diagnostics.html',
                                    title=tab_title("Diagnostics"),
                                    active_alerts=self.active_alerts,
@@ -601,7 +599,6 @@ class HttpServer():
 
         @app.route('/apply_config', methods=['POST'])
         def apply_config():
-            # read udp dest, lidar port, imu port from the form and apply them
             udp_dest = request.form.get('udp_dest')
             if udp_dest:
                 self._sensor.sensor_info.config.udp_dest = udp_dest
@@ -620,7 +617,6 @@ class HttpServer():
             operating_mode = request.form.get('operating_mode')
             if operating_mode:
                 self._sensor.sensor_info.config.operating_mode = OperatingMode.from_string(operating_mode)
-            # TODO: display the confirmation message
             return configuration()
 
         @app.route('/disclaimer')
@@ -649,11 +645,12 @@ class HttpServer():
         try:
             from waitress import create_server
             self._waitress_server = create_server(app, host=self._http_addr, port=self._http_port)
-        except PermissionError:
-            click.secho("Permission error!",
-                        fg='red')
-            raise RuntimeError("http server failed to start")
+        except PermissionError as e:
+            self.bind_error = f"PermissionError: {e}"
+            click.secho("Permission error!", fg='red')
+            raise RuntimeError("http server failed to start") from e
         except Exception as e:
+            self.bind_error = f"{type(e).__name__}: {e}"
             print("Unknown error: " + str(e))
             raise RuntimeError("http server failed to start") from e
 
@@ -815,5 +812,4 @@ class ScanSourceUdpReplay():
 
         sock_lidar.close()
         sock_imu.close()
-
 

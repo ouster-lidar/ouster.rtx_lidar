@@ -33,6 +33,7 @@ class OgnOusterLidarInternalState:
         self.scan_range_m = None
         self.scan_intensity = None
         self.http_server = None
+        self.http_server_error = ""
         self.sock_lidar = None
         self.sock_imu = None
         self.packet_queue = None
@@ -47,15 +48,16 @@ class OgnOusterLidarInternalState:
         self._last_udp_dest = None
         self._last_udp_port_lidar = None
         self._last_udp_port_imu = None
+        self._last_http_addr = None
         self._last_http_port = None
         self._last_enabled = None
 
-    def needs_reinit(self, sensor_path, sensor_variant, udp_dest, udp_port_lidar, udp_port_imu, http_port, enabled):
-        """Check if any configuration changed that requires reinitialization."""
+    def needs_reinit(self, sensor_path, sensor_variant, udp_dest, udp_port_lidar, udp_port_imu, http_addr, http_port, enabled):
         return (self._last_sensor_path != sensor_path or
                 self._last_sensor_variant != sensor_variant or
                 self._last_udp_port_lidar != udp_port_lidar or
                 self._last_udp_port_imu != udp_port_imu or
+                self._last_http_addr != http_addr or
                 self._last_http_port != http_port)
 
     def config_changed_runtime(self, udp_dest, enabled):
@@ -63,12 +65,13 @@ class OgnOusterLidarInternalState:
         return (self._last_udp_dest != udp_dest or
                 self._last_enabled != enabled)
 
-    def save_config(self, sensor_path, sensor_variant, udp_dest, udp_port_lidar, udp_port_imu, http_port, enabled):
+    def save_config(self, sensor_path, sensor_variant, udp_dest, udp_port_lidar, udp_port_imu, http_addr, http_port, enabled):
         self._last_sensor_path = sensor_path
         self._last_sensor_variant = sensor_variant
         self._last_udp_dest = udp_dest
         self._last_udp_port_lidar = udp_port_lidar
         self._last_udp_port_imu = udp_port_imu
+        self._last_http_addr = http_addr
         self._last_http_port = http_port
         self._last_enabled = enabled
 
@@ -201,8 +204,16 @@ class OgnOusterLidar:
         state.annotator.attach([state.render_product_path])
 
     @staticmethod
-    def _start_streaming(state, udp_dest, udp_port_lidar, udp_port_imu, http_port):
-        """Initialize UDP sockets and packet sender thread."""
+    def _start_streaming(state, udp_dest, udp_port_lidar, udp_port_imu, http_addr, http_port):
+        """Initialize UDP sockets and packet sender thread.
+
+        The sender thread reads udp_dest/udp_port_lidar/udp_port_imu LIVE from
+        state.sensor_info.config on every send, not from the arguments passed
+        here. This is required because the HTTP API (configure_sensor, called
+        by Detect or ouster-cli) mutates state.sensor_info.config.udp_dest
+        directly at runtime; a value captured once at thread spawn would go
+        stale the moment an external client reconfigures the destination.
+        """
         state.scan = LidarScan(state.sensor_info)
         state.frame_id = 0
         state.pkt_count = 0
@@ -211,7 +222,6 @@ class OgnOusterLidar:
         state.packet_queue = queue.Queue()
         state.packet_sender_stop = threading.Event()
 
-        # HTTP server
         class _SensorHolder:
             def __init__(self, si):
                 self._si = si
@@ -220,14 +230,23 @@ class OgnOusterLidar:
                 return self._si
 
         holder = _SensorHolder(state.sensor_info)
-        state.http_server = HttpServer(holder, "127.0.0.1", http_port, autostart=True)
 
-        # UDP sockets
+        try:
+            state.http_server = HttpServer(holder, http_addr, http_port, autostart=True)
+            state.http_server_error = ""
+        except Exception as e:
+            state.http_server = None
+            state.http_server_error = f"{type(e).__name__}: {e}"
+            # HTTP bind failed. UDP sockets are intentionally not created.
+            # Ensure we don't enqueue packets while streaming isn't running.
+            state.packet_queue = None
+            state.packet_sender_stop = None
+            return
+
         state.sock_lidar = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         state.sock_imu = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-        # Packet sender thread
-        def _sender_loop(pkt_queue, stop_event, sock_l, sock_i, dest, port_l, port_i, state_ref):
+        def _sender_loop(pkt_queue, stop_event, sock_l, sock_i, state_ref):
             last_ts = None
             while True:
                 item = pkt_queue.get()
@@ -244,10 +263,12 @@ class OgnOusterLidar:
                     if stop_event.is_set():
                         break
                 try:
+                    cfg = state_ref.sensor_info.config
+                    dest = cfg.udp_dest
                     if pkt_type == PacketType.Lidar:
-                        sock_l.sendto(payload, (dest, port_l))
+                        sock_l.sendto(payload, (dest, cfg.udp_port_lidar))
                     elif pkt_type == PacketType.Imu:
-                        sock_i.sendto(payload, (dest, port_i))
+                        sock_i.sendto(payload, (dest, cfg.udp_port_imu))
                     state_ref.pkt_count += 1
                 except OSError:
                     break
@@ -256,8 +277,7 @@ class OgnOusterLidar:
         state.packet_sender_thread = threading.Thread(
             target=_sender_loop,
             args=(state.packet_queue, state.packet_sender_stop,
-                  state.sock_lidar, state.sock_imu,
-                  udp_dest, udp_port_lidar, udp_port_imu, state),
+                  state.sock_lidar, state.sock_imu, state),
             daemon=True,
         )
         state.packet_sender_thread.start()
@@ -347,26 +367,24 @@ class OgnOusterLidar:
         udp_dest = db.inputs.udpDest
         udp_port_lidar = db.inputs.udpPortLidar
         udp_port_imu = db.inputs.udpPortImu
+        http_addr = db.inputs.httpAddr
         http_port = db.inputs.httpPort
         enabled = db.inputs.enabled
 
         if not sensor_path:
             db.outputs.execOut = og.ExecutionAttributeState.DISABLED
-            print("OgnOusterLidar: Missing sensor path, disabling execution")
+            db.log_warn("OgnOusterLidar: no sensor prim path set, disabling execution")
             return False
 
-        # Auto-resolve sensor variant from prim if not explicitly set
         if not sensor_variant:
             sensor_variant = OgnOusterLidar._read_sensor_variant_from_prim(sensor_path)
             if not sensor_variant:
                 db.outputs.execOut = og.ExecutionAttributeState.DISABLED
-                print(f"OgnOusterLidar: Could not read sensorModelConfig from prim '{sensor_path}'")
+                db.log_warn(f"OgnOusterLidar: could not read sensorModelConfig from prim '{sensor_path}'")
                 return False
 
-        # Initialize or reinitialize if config changed
         if not state.initialized or state.needs_reinit(
-                sensor_path, sensor_variant, udp_dest, udp_port_lidar, udp_port_imu, http_port, enabled):
-            # Tear down existing
+                sensor_path, sensor_variant, udp_dest, udp_port_lidar, udp_port_imu, http_addr, http_port, enabled):
             if state.initialized:
                 OgnOusterLidar._stop_streaming(state)
                 OgnOusterLidar._teardown_pipeline(state)
@@ -386,22 +404,34 @@ class OgnOusterLidar:
             OgnOusterLidar._setup_pipeline(state, sensor_path)
 
             if enabled:
-                OgnOusterLidar._start_streaming(state, udp_dest, udp_port_lidar, udp_port_imu, http_port)
+                OgnOusterLidar._start_streaming(state, udp_dest, udp_port_lidar, udp_port_imu, http_addr, http_port)
+                if state.http_server_error:
+                    db.log_error(f"OgnOusterLidar: HTTP bind failed on {http_addr}:{http_port} -> {state.http_server_error}")
 
             state.initialized = True
-            state.save_config(sensor_path, sensor_variant, udp_dest, udp_port_lidar, udp_port_imu, http_port, enabled)
+            state.save_config(sensor_path, sensor_variant, udp_dest, udp_port_lidar, udp_port_imu, http_addr, http_port, enabled)
 
-        # Handle runtime changes (enable/disable, udp_dest change)
         if state.config_changed_runtime(udp_dest, enabled):
             if not enabled and state.sock_lidar is not None:
                 OgnOusterLidar._stop_streaming(state)
             elif enabled and state.sock_lidar is None:
-                OgnOusterLidar._start_streaming(state, udp_dest, udp_port_lidar, udp_port_imu, http_port)
+                OgnOusterLidar._start_streaming(state, udp_dest, udp_port_lidar, udp_port_imu, http_addr, http_port)
+                if state.http_server_error:
+                    db.log_error(f"OgnOusterLidar: HTTP bind failed on {http_addr}:{http_port} -> {state.http_server_error}")
             if state.sensor_info is not None:
                 state.sensor_info.config.udp_dest = udp_dest
-            state.save_config(sensor_path, sensor_variant, udp_dest, udp_port_lidar, udp_port_imu, http_port, enabled)
+            state.save_config(sensor_path, sensor_variant, udp_dest, udp_port_lidar, udp_port_imu, http_addr, http_port, enabled)
 
-        # Process frame if enabled
+        # --- Debug outputs, populated every tick ---
+        db.outputs.httpServerError = state.http_server_error or ""
+        if state.http_server is not None:
+            db.outputs.httpBoundAddr = f"{http_addr}:{http_port}"
+            db.outputs.lastClientAddr = state.http_server.last_client_addr
+        else:
+            db.outputs.httpBoundAddr = ""
+            db.outputs.lastClientAddr = ""
+        db.outputs.packetsSent = state.pkt_count
+
         if not enabled or state.annotator is None:
             db.outputs.execOut = og.ExecutionAttributeState.DISABLED
             return True
