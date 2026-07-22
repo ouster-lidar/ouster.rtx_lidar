@@ -1,3 +1,30 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Jorge Octavio Martinez Tovar, Ussama Naal
+"""ouster.rtx_lidar -- sensor HTTP API emulation and pcap replay.
+
+This module provides two independent pieces:
+
+1. HttpServer -- an emulation of the Ouster sensor HTTP API (metadata,
+   config, telemetry, alerts, and the browser dashboard) backed by a live
+   SensorInfo object. This is the component the Isaac Sim OGN node
+   (OgnOusterLidar) imports: it is what makes Ouster Detect / ouster-cli
+   discover and configure the virtual sensor as if it were hardware.
+   CHECKPOINT A (B1): each HttpServer instance owns its own Flask app, so
+   multiple virtual sensors coexist in one process (each bound to its own
+   NIC IP on port 80; see SENSOR_CONVENTION.md).
+
+2. ScanSourceUdpReplay / PacketSourcePacer / mDNSService -- a standalone
+   pcap replay tool that re-emits a recorded physical-sensor capture over
+   UDP with realtime pacing. NOT used by the Isaac Sim workflow; kept
+   as-is and unmaintained (see the marker above ScanSourceUdpReplay).
+
+Authors:
+    Jorge Octavio Martinez Tovar (Digital Twin Engineering, Ternium
+      Pesqueria) -- multi-sensor HTTP support (B1), integration.
+    Ussama Naal (Ouster, Inc.) -- original sensor HTTP API emulation
+      and pcap replay tooling.
+"""
+
 import socket
 import psutil
 import ipaddress
@@ -22,7 +49,13 @@ def ts_format(ts):
     return datetime.fromtimestamp(ts * 1e-9, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f %Z')
 
 
-app = Flask(__name__)
+# CHECKPOINT A / B1: the module-level `app = Flask(__name__)` was REMOVED.
+# It was the root cause of the multi-sensor blocker: every HttpServer
+# registered its routes on the shared global app, so a second sensor node
+# raised AssertionError (duplicate endpoint names) at construction, and
+# hot-reload of the extension re-registered routes on the surviving global.
+# Each HttpServer now owns its own Flask app (see HttpServer.__init__).
+
 
 class PacketSourcePacer():
 
@@ -169,6 +202,15 @@ class HttpServer():
         self._autostart = autostart
         self.last_client_addr = ""
         self.bind_error = ""
+
+        # B1: per-instance Flask app. Each HttpServer owns its own app, so
+        # multiple sensor nodes (each with its own HTTP port) no longer
+        # collide on a shared module-global route map. Flask(__name__) keeps
+        # template resolution working for the dashboard routes. The local
+        # name `app` deliberately shadows nothing at module level anymore;
+        # every @app.route below binds to THIS instance's app.
+        self._app = Flask(__name__)
+        app = self._app
 
         def _sensor_info_as_json(sensor_info):
             sensor_info_json = json.loads(sensor_info.to_json_string())
@@ -644,7 +686,8 @@ class HttpServer():
 
         try:
             from waitress import create_server
-            self._waitress_server = create_server(app, host=self._http_addr, port=self._http_port)
+            # B1: serve THIS instance's app, not a module global.
+            self._waitress_server = create_server(self._app, host=self._http_addr, port=self._http_port)
         except PermissionError as e:
             self.bind_error = f"PermissionError: {e}"
             click.secho("Permission error!", fg='red')
@@ -696,6 +739,11 @@ class HttpServer():
         print("http server stopped")
 
 
+# ============================================================================
+# REPLAY PATH (ScanSourceUdpReplay / PacketSourcePacer usage below + mDNS):
+# confirmed NOT in use for the Isaac Sim workflow (2026-07). Kept as-is,
+# unmaintained. The Isaac node only imports HttpServer from this module.
+# ============================================================================
 class ScanSourceUdpReplay():
 
     def __init__(self, packet_source_factory, source_url, http_addr, http_port, loop, rate, soft_id_check, lidar_port=-1,
@@ -812,4 +860,3 @@ class ScanSourceUdpReplay():
 
         sock_lidar.close()
         sock_imu.close()
-
