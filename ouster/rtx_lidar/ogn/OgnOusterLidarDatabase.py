@@ -1,5 +1,3 @@
-# SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Jorge Octavio Martinez Tovar, Ussama Naal
 """Support for simplified access to data on nodes of type ouster.rtx_lidar.OgnOusterLidar
 
 Ouster RTX Lidar streaming node. Reads the RTX lidar sensor output, converts it
