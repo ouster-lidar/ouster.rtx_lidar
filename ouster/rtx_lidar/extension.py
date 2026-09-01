@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Jorge Octavio Martinez Tovar, Ussama Naal
+# Copyright (c) 2026 Jorge Octavio Martinez Tovar
 """ouster.rtx_lidar -- sensor HTTP API emulation and pcap replay.
 
 This module provides two independent pieces:
@@ -18,11 +18,8 @@ This module provides two independent pieces:
    UDP with realtime pacing. NOT used by the Isaac Sim workflow; kept
    as-is and unmaintained (see the marker above ScanSourceUdpReplay).
 
-Authors:
-    Jorge Octavio Martinez Tovar (Digital Twin Engineering, Ternium
-      Pesqueria) -- multi-sensor HTTP support (B1), integration.
-    Ussama Naal (Ouster, Inc.) -- original sensor HTTP API emulation
-      and pcap replay tooling.
+Author / maintainer: Jorge Octavio Martinez Tovar
+                     (Digital Twin Engineering, Ternium Pesqueria)
 """
 
 import socket
@@ -254,7 +251,10 @@ class HttpServer():
                     return jsonify({"error": {
                         "title": "500 Internal Server Error",
                         "description": "Command \"set_config_param\" failed: error: Expected 1-2 arguments"}})
+                # CHECKPOINT B: logged for client-protocol visibility.
+                print(f"[sensor API] POST /sensor/config from {request.remote_addr}: {sensor_config}")
                 self.configure_sensor(sensor_config, request.remote_addr)
+                self.last_client_addr = request.remote_addr
                 return jsonify({"message": "Configuration updated successfully"})
             elif request.method == 'DELETE':
                 # sensor_config.clear()
@@ -275,19 +275,50 @@ class HttpServer():
 
         @app.route('/api/v1/sensor/cmd/set_udp_dest_auto', methods=['GET'])
         def set_udp_dest_auto():
+            # CHECKPOINT B: logged for client-protocol visibility.
+            print(f"[sensor API] set_udp_dest_auto from {request.remote_addr}")
             self._sensor.sensor_info.config.udp_dest = request.remote_addr
             self.last_client_addr = request.remote_addr
             return "{}"
 
         @app.route('/api/v1/sensor/cmd/set_config_param', methods=['GET', 'POST', 'DELETE'])
         def set_config_param():
-            # parse the lidar udp and imu udp from the request
+            # CHECKPOINT B: dual-format parser. Real Ouster sensors accept
+            # BOTH arg formats on this endpoint and clients use both:
+            #   JSON:            args={"udp_dest": "10.125.21.1", ...}
+            #   space-separated: args=udp_dest 10.125.21.1
+            # The previous implementation handled JSON only; a client using
+            # the space-separated form (observed with Detect for udp_dest)
+            # got a 500 and its push was silently lost, leaving the node
+            # streaming to a stale/empty destination while the client
+            # believed the sensor was configured. Every request is logged
+            # so the exact client protocol is visible in the console.
             args = request.args.get('args')
+            print(f"[sensor API] set_config_param from {request.remote_addr}: {args!r}")
             sensor_config = {}
-            try:
-                args = args[args.index('{'):]
-                sensor_config = json.loads(args)
-            except Exception:
+            parsed = False
+            if args:
+                # Attempt 1: JSON payload (with or without leading junk)
+                try:
+                    sensor_config = json.loads(args[args.index('{'):])
+                    parsed = True
+                except (ValueError, TypeError):
+                    pass
+                # Attempt 2: "param value" space-separated form
+                if not parsed:
+                    parts = args.strip().split(None, 1)
+                    if len(parts) == 2:
+                        key, value = parts[0], parts[1].strip().strip('"')
+                        if key in ("udp_port_lidar", "udp_port_imu", "udp_port_zm"):
+                            try:
+                                sensor_config = {key: int(value)}
+                                parsed = True
+                            except ValueError:
+                                pass
+                        else:
+                            sensor_config = {key: value}
+                            parsed = True
+            if not parsed:
                 return jsonify({"error": {
                     "title": "500 Internal Server Error",
                     "description": "Command \"set_config_param\" failed: error: Expected 1-2 arguments"}})
