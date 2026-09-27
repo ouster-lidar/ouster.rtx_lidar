@@ -18,6 +18,39 @@ from ouster.sdk.util.parsing import scan_to_packets
 from ouster.rtx_lidar.extension import HttpServer
 
 
+_gmo_parser = None
+
+
+def _parse_gmo(data):
+    """Parse GenericModelOutput annotator data on Isaac Sim 5.1 and 6.0+.
+
+    6.0 deprecates isaacsim.sensors.rtx (get_gmo_data) in favour of
+    isaacsim.sensors.experimental.rtx (parse_generic_model_output_data); the
+    struct fields used here are identical in both. The import is resolved once
+    and cached: a failed import is not cached by Python and would re-scan
+    sys.path on every tick under 5.1.
+    """
+    global _gmo_parser
+    if _gmo_parser is None:
+        try:
+            from isaacsim.sensors.experimental.rtx import parse_generic_model_output_data as parser
+        except ImportError:
+            from isaacsim.sensors.rtx import get_gmo_data as parser
+        _gmo_parser = parser
+    return _gmo_parser(data)
+
+
+def _schema_defines(prim, name):
+    """True if the prim's applied schemas define the attribute `name`.
+
+    HasAttribute() is also true for an opinion authored against another schema
+    version, e.g. a 5.1-authored asset (or a stage this node saved on 5.1, which
+    carries auxOutputType=BASIC) opened in 6.0 -- exactly the case the version
+    branches in _setup_pipeline have to tell apart.
+    """
+    return bool(prim.GetPrimDefinition().GetAttributeDefinition(name))
+
+
 class OgnOusterLidarInternalState:
     """Per-node internal state for the Ouster Lidar OGN node."""
 
@@ -44,6 +77,10 @@ class OgnOusterLidarInternalState:
         self.accum_columns = None
         self.last_tick = None
         self.last_gmo_key = None
+        self.rotation_published = False
+        self.last_publish_coverage = 1.0
+        self.partial_rotations = 0
+        self.warned_partial_rotation = False
         self.max_returns = 1
         # Track last config to detect changes
         self._last_sensor_path = None
@@ -82,6 +119,18 @@ class OgnOusterLidarInternalState:
 class OgnOusterLidar:
     """Ouster RTX Lidar streaming node for OmniGraph ActionGraph."""
 
+    # Minimum fraction of a rotation's columns that must have been filled for it
+    # to be published; unfilled columns go out as zeros (no return). The GMO
+    # annotator only exposes its latest frame, so when two sensor frames land
+    # between two node reads the older one is lost upstream: measured on the
+    # Lidar_Reflective_Room-minimal.usd scene over 600 updates, 49 lost frames on
+    # 6.0 and 0-19 on 5.1, each a GMO frameId step of 2 / 33.3 ms of sim time
+    # and ~171 of 1024 columns, with no correlation to slow updates. Requiring
+    # full coverage dropped every such rotation (6.0 streamed ~7 Hz instead of
+    # 10). 0.5 tolerates one or two lost 60 Hz frames per rotation while still
+    # rejecting the partial first rotation after play or a sim reset.
+    SCAN_MIN_COVERAGE = 0.5
+
     @staticmethod
     def internal_state():
         return OgnOusterLidarInternalState()
@@ -106,7 +155,7 @@ class OgnOusterLidar:
 
     @staticmethod
     def _compose_sensor_info(lidar_sensor_variant, udp_port_lidar, udp_port_imu, udp_dest, sensor_path=None):
-        """Build metadata from JSON, overridden by the live Isaac 5.1 OmniLidar."""
+        """Build metadata from JSON, overridden by the live OmniLidar prim (Isaac Sim 5.1 / 6.0)."""
         import omni.usd
         ext_manager = omni.kit.app.get_app_interface().get_extension_manager()
         ext_id = ext_manager.get_enabled_extension_id("isaacsim.sensors.rtx")
@@ -126,13 +175,36 @@ class OgnOusterLidar:
             stage = omni.usd.get_context().get_stage()
             prim = stage.GetPrimAtPath(f"{sensor_path}/sensor")
             if not prim.IsValid() or prim.GetTypeName() != "OmniLidar":
-                raise ValueError("Indexed streaming requires an Isaac Sim 5.1 OmniLidar sensor prim")
-            for name in ("numberOfEmitters", "maxReturns", "scanRateBaseHz", "reportRateBaseHz",
-                         "rotationDirection", "scanType", "startAzimuthDeg", "endAzimuthDeg",
-                         "emitterStateCount"):
-                value = prim.GetAttribute(f"omni:sensor:Core:{name}").Get()
-                if value is not None:
-                    lidar_cfg[name] = value
+                raise ValueError("Indexed streaming requires an OmniLidar sensor prim")
+            # JSON key -> prim attribute names, newest first. Isaac Sim 6.0
+            # renamed reportRateBaseHz to patternFiringRateHz and
+            # start/endAzimuthDeg to validStart/validEndAzimuthDeg (5.1 already
+            # carries the valid* names), and dropped emitterStateCount (counted
+            # below instead). The first name with an *authored* value wins, then
+            # the first with any value (schema fallback), then the JSON.
+            # Authored-first matters on 6.0 with a 5.1-authored asset such as the
+            # OS0 in Lidar_Reflective_Room-minimal.usd: it authors
+            # reportRateBaseHz=10240 while patternFiringRateHz resolves to the 6.0
+            # schema fallback 36000, which advertised 3600 columns.
+            for key, names in (("numberOfEmitters", ("numberOfEmitters",)),
+                               ("maxReturns", ("maxReturns",)),
+                               ("scanRateBaseHz", ("scanRateBaseHz",)),
+                               ("reportRateBaseHz", ("patternFiringRateHz", "reportRateBaseHz")),
+                               ("rotationDirection", ("rotationDirection",)),
+                               ("scanType", ("scanType",)),
+                               ("startAzimuthDeg", ("validStartAzimuthDeg", "startAzimuthDeg")),
+                               ("endAzimuthDeg", ("validEndAzimuthDeg", "endAzimuthDeg")),
+                               ("emitterStateCount", ("emitterStateCount",))):
+                attrs = [prim.GetAttribute(f"omni:sensor:Core:{name}") for name in names]
+                attrs = [attr for attr in attrs if attr.IsValid() and attr.Get() is not None]
+                authored = [attr for attr in attrs if attr.HasAuthoredValue()]
+                if authored or attrs:
+                    lidar_cfg[key] = (authored or attrs)[0].Get()
+            # 6.0: one OmniSensorGenericLidarCoreEmitterStateAPI:s### instance per state.
+            states = [s for s in prim.GetAppliedSchemas()
+                      if s.startswith("OmniSensorGenericLidarCoreEmitterStateAPI:")]
+            if states:
+                lidar_cfg["emitterStateCount"] = len(states)
             emitter = dict(lidar_cfg["emitterStates"][0])
             for name in ("azimuthDeg", "elevationDeg"):
                 value = prim.GetAttribute(f"omni:sensor:Core:emitterState:s001:{name}").Get()
@@ -207,11 +279,41 @@ class OgnOusterLidar:
         import omni.usd
         from pxr import Sdf
         prim = omni.usd.get_context().get_stage().GetPrimAtPath(f"{sensor_path}/sensor")
-        for name, value in (("auxOutputType", "BASIC"), ("elementsCoordsType", "SPHERICAL"),
+        for name, value in (("elementsCoordsType", "SPHERICAL"),
                             ("outputFrameOfReference", "SENSOR"),
                             ("outputMotionCompensationState", "NONCOMPENSATED")):
             prim.CreateAttribute(f"omni:sensor:Core:{name}", Sdf.ValueTypeNames.Token).Set(value)
         prim.CreateAttribute("omni:sensor:Core:skipDroppingInvalidPoints", Sdf.ValueTypeNames.Bool).Set(True)
+        # Aux level (tickId/channelId/emitterId): 5.1 reads Core:auxOutputType;
+        # 6.0 removed it from the schema and reads the RenderVar channels
+        # attribute (what isaacsim.sensors.experimental.rtx authors). Branch on
+        # the schema rather than writing both, so neither version gets an
+        # unknown attribute. Verified headless: header auxType == BASIC on both.
+        if _schema_defines(prim, "omni:sensor:Core:auxOutputType"):
+            prim.GetAttribute("omni:sensor:Core:auxOutputType").Set("BASIC")
+        else:
+            prim.CreateAttribute("_replicator:rendervar:GenericModelOutput:channels",
+                                 Sdf.ValueTypeNames.StringArray, True).Set(["BASIC"])
+        # 6.0 Ouster assets author accumulateOutputs=True: every GMO is then an
+        # overlapping full-rotation buffer whose aux arrays are not in
+        # (tick, channel, echo) order (each 256-element run of ticks 0..170
+        # starts with one stray element from tick 853+k), which
+        # _accumulate_gmo would read as ~170 wraps per buffer. Per-frame
+        # batches restore the 5.1 layout: 171 ticks x 128 ch x 2 slots.
+        if _schema_defines(prim, "omni:sensor:Core:accumulateOutputs"):
+            prim.GetAttribute("omni:sensor:Core:accumulateOutputs").Set(False)
+        # 6.0 fires at Core:patternFiringRateHz, the renamed reportRateBaseHz. A
+        # 5.1-authored asset (the OS0 referenced by
+        # Lidar_Reflective_Room-minimal.usd) authors only reportRateBaseHz, so
+        # 6.0 falls back to the schema's 36000 Hz and, for that OS0, produced no
+        # GMO elements at all (measured: 0 of 200 frames; 43776 per frame, ticks
+        # 0..1023, once set to 10240). Carry the authored rate over. On 5.1 the
+        # schema has no patternFiringRateHz, so this is a no-op there.
+        pattern_rate = prim.GetAttribute("omni:sensor:Core:patternFiringRateHz")
+        legacy_rate = prim.GetAttribute("omni:sensor:Core:reportRateBaseHz")
+        if (_schema_defines(prim, "omni:sensor:Core:patternFiringRateHz") and not pattern_rate.HasAuthoredValue()
+                and legacy_rate.IsValid() and legacy_rate.HasAuthoredValue()):
+            pattern_rate.Set(int(legacy_rate.Get()))
         state.render_product = rep.create.render_product(
             f"{sensor_path}/sensor", [1, 1],
             name="OgnOusterLidarRenderProduct",
@@ -243,6 +345,9 @@ class OgnOusterLidar:
         state.accum_columns = None
         state.last_tick = None
         state.last_gmo_key = None
+        state.rotation_published = False
+        state.last_publish_coverage = 1.0
+        state.partial_rotations = 0
         state.packet_queue = queue.Queue()
         state.packet_sender_stop = threading.Event()
 
@@ -352,12 +457,27 @@ class OgnOusterLidar:
 
     @staticmethod
     def _accumulate_gmo(state, gmo):
-        """Copy first echoes by firing ID; publish only fully covered rotations.
+        """Copy first echoes by firing ID; publish each rotation once it ends.
+
+        A rotation is published when tick W-1 arrives or, if the batch carrying
+        it was lost, when the next rotation starts, provided at least
+        SCAN_MIN_COVERAGE of its columns were filled; missing columns are zeros.
 
         Dense GMO order is (tick, channel, echo), whereas Ouster fields are
         (channel, tick). Neither angle lookup nor destaggering belongs here.
         Raw spherical ranges share the virtual sensor origin, so metadata must
         not add physical Ouster beam-origin translations.
+
+        Row key is emitterId: it indexes the emitterState azimuth/elevation
+        tables that beam_azimuth/altitude_angles are built from. (GMO channelId
+        equals it, 0-based, on 5.1 and 6.0, but channelId is the detector
+        mapping and 6.0's schema default table is 1-based.)
+
+        Echo rank is taken from position within each (tick, emitter) run, not
+        from echoId: 6.0 BASIC reports echoId 0 for both return slots, so an
+        echoId == 0 filter kept the always-invalid second slot, which then
+        overwrote the first. Position rank equals echoId on 100% of a 5.1
+        capture.
         """
         width = int(state.sensor_info.format.columns_per_frame)
         height = int(state.sensor_info.format.pixels_per_column)
@@ -369,33 +489,51 @@ class OgnOusterLidar:
             state.accum_intensity = np.zeros((height, width), dtype=np.float32)
             state.accum_columns = np.zeros(width, dtype=bool)
             state.last_tick = None
+            state.rotation_published = False
         state.last_gmo_key = key
-        channels = np.asarray(gmo.channelId)
+        channels = np.asarray(gmo.emitterId)
         ticks = np.asarray(gmo.tickId)
-        echoes = np.asarray(gmo.echoId)
         distance = np.asarray(gmo.z)
         intensity = np.asarray(gmo.scalar)
         flags = np.asarray(gmo.flags)
-        if any(values.size != gmo.numElements for values in (channels, ticks, echoes, distance, intensity, flags)):
+        if any(values.size != gmo.numElements for values in (channels, ticks, distance, intensity, flags)):
             raise ValueError("GMO requires BASIC auxiliary data with one firing ID per element")
         if np.any(channels >= height):
             raise ValueError("GMO firing IDs do not match the advertised sensor dimensions")
         ticks = ticks % width
-        first_echo = echoes == 0
+        run_key = ticks.astype(np.int64) * height + channels
+        run_start = np.r_[True, run_key[1:] != run_key[:-1]]
+        position = np.arange(run_key.size)
+        first_echo = position == np.maximum.accumulate(np.where(run_start, position, 0))
         channels, ticks = channels[first_echo], ticks[first_echo]
         valid = ((flags[first_echo] & 64) != 0) & np.isfinite(distance[first_echo]) & (distance[first_echo] > 0)
         distance = np.where(valid, distance[first_echo], 0)
         intensity = np.where(valid, np.nan_to_num(intensity[first_echo]), 0)
         boundaries = np.flatnonzero(ticks[1:] < ticks[:-1]) + 1
         completed = False
+
+        def publish():
+            # Columns no batch reached this rotation are still 0 (no return), since
+            # the accumulator is cleared at every rotation boundary.
+            state.scan_range_m = state.accum_range_m.copy()
+            state.scan_intensity = state.accum_intensity.copy()
+            state.last_publish_coverage = float(np.mean(state.accum_columns))
+            state.rotation_published = True
+
         for indices in np.split(np.arange(ticks.size), boundaries):
             if not indices.size:
                 continue
             segment_ticks = ticks[indices]
             if state.last_tick is not None and segment_ticks[0] < state.last_tick:
+                # Wrapped without seeing tick W-1: the batch carrying the end of
+                # the previous rotation was lost, so publish it here instead.
+                if not state.rotation_published and np.mean(state.accum_columns) >= OgnOusterLidar.SCAN_MIN_COVERAGE:
+                    publish()
+                    completed = True
                 state.accum_range_m.fill(0)
                 state.accum_intensity.fill(0)
                 state.accum_columns.fill(False)
+                state.rotation_published = False
             segment_channels = channels[indices]
             dense = (indices.size % height == 0 and
                      np.all(segment_channels.reshape(-1, height) == np.arange(height)) and
@@ -410,9 +548,9 @@ class OgnOusterLidar:
                 state.accum_intensity[segment_channels, segment_ticks] = intensity[indices]
             state.accum_columns[columns] = True
             state.last_tick = int(segment_ticks[-1])
-            if state.last_tick == width - 1 and np.all(state.accum_columns):
-                state.scan_range_m = state.accum_range_m.copy()
-                state.scan_intensity = state.accum_intensity.copy()
+            if (state.last_tick == width - 1 and not state.rotation_published and
+                    np.mean(state.accum_columns) >= OgnOusterLidar.SCAN_MIN_COVERAGE):
+                publish()
                 completed = True
         return completed
 
@@ -495,19 +633,26 @@ class OgnOusterLidar:
             db.outputs.execOut = og.ExecutionAttributeState.DISABLED
             return True
 
-        from isaacsim.sensors.rtx import get_gmo_data
         scan_data = state.annotator.get_data()
         if scan_data is None or len(scan_data) == 0:
             db.outputs.execOut = og.ExecutionAttributeState.ENABLED
             return True
 
-        gmo = get_gmo_data(scan_data)
+        gmo = _parse_gmo(scan_data)
         if gmo.magicNumber != 0x4E474D4F or gmo.numElements == 0:
             db.outputs.execOut = og.ExecutionAttributeState.ENABLED
             return True
         if not OgnOusterLidar._accumulate_gmo(state, gmo):
             db.outputs.execOut = og.ExecutionAttributeState.ENABLED
             return True
+        if state.last_publish_coverage < 1.0:
+            state.partial_rotations += 1
+            if not state.warned_partial_rotation:
+                state.warned_partial_rotation = True
+                db.log_warn(
+                    f"OgnOusterLidar: published a rotation with {100 * (1 - state.last_publish_coverage):.0f}% of "
+                    "columns zero-filled (a GMO frame was superseded before this node read it). Further partial "
+                    "rotations are counted in state.partial_rotations and not logged.")
 
         width = int(state.sensor_info.format.columns_per_frame)
         scan_range_m, scan_intensity = state.scan_range_m, state.scan_intensity
