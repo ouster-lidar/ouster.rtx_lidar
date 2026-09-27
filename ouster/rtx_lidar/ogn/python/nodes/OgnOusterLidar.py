@@ -192,7 +192,7 @@ class OgnOusterLidar:
         sensor_info.format.fps = scan_rate_hz
         sensor_info.format.header_type = HeaderType.STANDARD
         sensor_info.format.pixel_shift_by_row = np.rint(
-            -np.asarray(azimuth_deg) * columns_per_frame / 360.0).astype(int).tolist()
+            np.asarray(azimuth_deg) * columns_per_frame / 360.0).astype(int).tolist()
         sensor_info.format.imu_measurements_per_packet = 0
         sensor_info.format.imu_packets_per_frame = 0
         sensor_info.format.pixels_per_column = num_channels
