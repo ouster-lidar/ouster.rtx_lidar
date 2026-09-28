@@ -38,3 +38,34 @@ to the Ouster sensor that we added earlier in first step. Your configuration sho
 ![configure-sensor](configure-sensor.png)
 
 Now you may click on IsaacSim play.
+
+## Motion BVH (optional)
+
+Motion BVH lets the lidar rays see objects at the position they have when each ray fires, so things
+moving during a scan are captured with motion effects. Without it Isaac Sim logs
+`MotionBVH for lidar model not enabled. This will result in an incorrect point cloud without motion effects!`
+when the sensor starts; the lidar still streams normally.
+
+Motion BVH is a renderer setting for the whole application: it applies to every sensor in the scene
+and cannot be set per sensor. It must be turned on **when Isaac Sim is launched**, by adding these
+flags to the command line:
+
+```bash
+./isaac-sim.sh \
+  --/renderer/raytracingMotion/enabled=true \
+  --/renderer/raytracingMotion/enableHydraEngineMasking=true \
+  --/renderer/raytracingMotion/enabledForHydraEngines=0
+```
+
+For standalone Python scripts, pass `enable_motion_bvh` when creating the app, which sets the same
+flags:
+
+```python
+from isaacsim import SimulationApp
+simulation_app = SimulationApp({"headless": True, "enable_motion_bvh": True})
+```
+
+Do not change these settings while Isaac Sim is running (for example from the Python console or a
+script after startup): on both Isaac Sim 5.1 and 6.0 the renderer then reports Motion BVH as on but
+the lidar stops producing data. To switch Motion BVH on or off, restart Isaac Sim with or without the
+flags. When it is on, the `MotionBVH for lidar model not enabled` warning no longer appears.

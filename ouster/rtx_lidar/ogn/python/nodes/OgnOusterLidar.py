@@ -1,11 +1,9 @@
 import numpy as np
 import omni.graph.core as og
-import omni.kit.app
 import omni.timeline
 import omni.replicator.core as rep
 
 import socket
-import json
 import queue
 import threading
 import time
@@ -102,74 +100,81 @@ class OgnOusterLidar:
         print("Variant set 'sensor' not found on this prim.")
         return None
 
+    # Lidar profile field -> OmniLidar attribute names (omni:sensor:Core:*), newest first. Isaac Sim
+    # 6.0 renamed reportRateBaseHz to patternFiringRateHz; both versions carry the azimuth window as
+    # validStart/validEndAzimuthDeg (start/endAzimuthDeg are older names).
+    _PROFILE_ATTRIBUTES = (
+        ("numberOfEmitters", ("numberOfEmitters",)),
+        ("maxReturns", ("maxReturns",)),
+        ("scanRateBaseHz", ("scanRateBaseHz",)),
+        ("reportRateBaseHz", ("patternFiringRateHz", "reportRateBaseHz")),
+        ("rotationDirection", ("rotationDirection",)),
+        ("scanType", ("scanType",)),
+        ("startAzimuthDeg", ("validStartAzimuthDeg", "startAzimuthDeg")),
+        ("endAzimuthDeg", ("validEndAzimuthDeg", "endAzimuthDeg")),
+    )
+
+    @staticmethod
+    def _read_lidar_profile(prim):
+        """Read the firing pattern from the live OmniLidar prim -- what the sensor actually fires.
+
+        The Isaac RTX lidar config JSON is not used at runtime by Isaac and on 6.0 it only exists
+        in the deprecated isaacsim.sensors.rtx. Verified headless on 5.1 and 6.0 for OS0 REV6/REV7,
+        OS1 32/128 and OS2 (10/20 Hz, 512-2048 columns): every field below is present on the prim
+        and equals the shipped JSON, apart from that JSON bug.
+
+        For each field the first name with an *authored* value wins, then the first with any value
+        (schema fallback). Authored-first matters on 6.0 with a 5.1-authored asset such as the OS0 in
+        Lidar_Reflective_Room-minimal.usd: it authors reportRateBaseHz=10240 while
+        patternFiringRateHz resolves to the 6.0 schema fallback 36000 (3600 columns). The azimuth
+        window is unauthored on every Ouster asset, so its schema fallback (0/360) is what the model
+        uses.
+        """
+        profile, missing = {}, []
+        for key, names in OgnOusterLidar._PROFILE_ATTRIBUTES:
+            attrs = [prim.GetAttribute(f"omni:sensor:Core:{name}") for name in names]
+            attrs = [attr for attr in attrs if attr.IsValid() and attr.Get() is not None]
+            authored = [attr for attr in attrs if attr.HasAuthoredValue()]
+            if authored or attrs:
+                profile[key] = (authored or attrs)[0].Get()
+            else:
+                missing.append("/".join(names))
+        # One emitter state per "omni:sensor:Core:emitterState:<sNNN>:..." attribute group (6.0
+        # applies an OmniSensorGenericLidarCoreEmitterStateAPI instance per state; 5.1 has no
+        # emitterStateCount attribute on the prim).
+        profile["emitterStateCount"] = len({name.split(":")[4] for name in prim.GetPropertyNames()
+                                            if name.startswith("omni:sensor:Core:emitterState:")})
+        for key in ("azimuthDeg", "elevationDeg"):
+            value = prim.GetAttribute(f"omni:sensor:Core:emitterState:s001:{key}").Get()
+            if value is None or len(value) == 0:
+                missing.append(f"emitterState:s001:{key}")
+            else:
+                profile[key] = list(value)
+        if missing:
+            raise ValueError(f"OmniLidar {prim.GetPath()} lacks omni:sensor:Core attributes: {', '.join(missing)}")
+        return profile
+
     @staticmethod
     def _compose_sensor_info(lidar_sensor_variant, udp_port_lidar, udp_port_imu, udp_dest, sensor_path=None):
-        """Build metadata from JSON, overridden by the live OmniLidar prim (Isaac Sim 5.1 / 6.0)."""
+        """Build the Ouster SensorInfo from the live OmniLidar prim at {sensor_path}/sensor (Isaac Sim 5.1 / 6.0)."""
         import omni.usd
-        ext_manager = omni.kit.app.get_app_interface().get_extension_manager()
-        ext_id = ext_manager.get_enabled_extension_id("isaacsim.sensors.rtx")
-        isaac_sim_ext_path = ext_manager.get_extension_path(ext_id)
-        # Derive sensor family (OS0, OS1, OS2) from variant name prefix
-        sensor_family = "OS0"  # default
-        for prefix in ("OS0", "OS1", "OS2"):
-            if lidar_sensor_variant.startswith(prefix):
-                sensor_family = prefix
-                break
-        lidar_config_path = f"{isaac_sim_ext_path}/data/lidar_configs/Ouster/{sensor_family}/{lidar_sensor_variant}.json"
-        print(f"Loading lidar config from {lidar_config_path}")
-        with open(lidar_config_path, "r") as f:
-            lidar_cfg = json.load(f)
-        lidar_cfg = lidar_cfg["profile"]
-        if sensor_path:
-            stage = omni.usd.get_context().get_stage()
-            prim = stage.GetPrimAtPath(f"{sensor_path}/sensor")
-            if not prim.IsValid() or prim.GetTypeName() != "OmniLidar":
-                raise ValueError("Indexed streaming requires an OmniLidar sensor prim")
-            # JSON key -> prim attribute names, newest first. Isaac Sim 6.0
-            # renamed reportRateBaseHz to patternFiringRateHz and
-            # start/endAzimuthDeg to validStart/validEndAzimuthDeg (5.1 already
-            # carries the valid* names), and dropped emitterStateCount (counted
-            # below instead). The first name with an *authored* value wins, then
-            # the first with any value (schema fallback), then the JSON.
-            # Authored-first matters on 6.0 with a 5.1-authored asset such as the
-            # OS0 in Lidar_Reflective_Room-minimal.usd: it authors
-            # reportRateBaseHz=10240 while patternFiringRateHz resolves to the 6.0
-            # schema fallback 36000, which advertised 3600 columns.
-            for key, names in (("numberOfEmitters", ("numberOfEmitters",)),
-                               ("maxReturns", ("maxReturns",)),
-                               ("scanRateBaseHz", ("scanRateBaseHz",)),
-                               ("reportRateBaseHz", ("patternFiringRateHz", "reportRateBaseHz")),
-                               ("rotationDirection", ("rotationDirection",)),
-                               ("scanType", ("scanType",)),
-                               ("startAzimuthDeg", ("validStartAzimuthDeg", "startAzimuthDeg")),
-                               ("endAzimuthDeg", ("validEndAzimuthDeg", "endAzimuthDeg")),
-                               ("emitterStateCount", ("emitterStateCount",))):
-                attrs = [prim.GetAttribute(f"omni:sensor:Core:{name}") for name in names]
-                attrs = [attr for attr in attrs if attr.IsValid() and attr.Get() is not None]
-                authored = [attr for attr in attrs if attr.HasAuthoredValue()]
-                if authored or attrs:
-                    lidar_cfg[key] = (authored or attrs)[0].Get()
-            # 6.0: one OmniSensorGenericLidarCoreEmitterStateAPI:s### instance per state.
-            states = [s for s in prim.GetAppliedSchemas()
-                      if s.startswith("OmniSensorGenericLidarCoreEmitterStateAPI:")]
-            if states:
-                lidar_cfg["emitterStateCount"] = len(states)
-            emitter = dict(lidar_cfg["emitterStates"][0])
-            for name in ("azimuthDeg", "elevationDeg"):
-                value = prim.GetAttribute(f"omni:sensor:Core:emitterState:s001:{name}").Get()
-                if value is not None:
-                    emitter[name] = list(value)
-            lidar_cfg["emitterStates"] = [emitter]
+        if not sensor_path:
+            raise ValueError("A sensor path is required to read the OmniLidar configuration")
+        prim = omni.usd.get_context().get_stage().GetPrimAtPath(f"{sensor_path}/sensor")
+        if not prim.IsValid() or prim.GetTypeName() != "OmniLidar":
+            raise ValueError(f"Indexed streaming requires an OmniLidar sensor prim at {sensor_path}/sensor")
+        lidar_cfg = OgnOusterLidar._read_lidar_profile(prim)
+        print(f"Composing Ouster metadata for {lidar_sensor_variant or prim.GetPath()} from {prim.GetPath()}")
         if (lidar_cfg["scanType"].upper() != "ROTARY" or
-                lidar_cfg.get("rotationDirection", "CW") != "CW" or
-                lidar_cfg.get("startAzimuthDeg", 0) != 0 or
-                lidar_cfg.get("endAzimuthDeg", 360) != 360 or
-                lidar_cfg.get("emitterStateCount", 1) != 1):
+                lidar_cfg["rotationDirection"] != "CW" or
+                lidar_cfg["startAzimuthDeg"] != 0 or
+                lidar_cfg["endAzimuthDeg"] != 360 or
+                lidar_cfg["emitterStateCount"] != 1):
             raise ValueError("Indexed streaming requires a full-circle CW lidar with one emitter state")
         num_channels = lidar_cfg["numberOfEmitters"]
-        max_returns = lidar_cfg.get("maxReturns", 1)
-        azimuth_deg = lidar_cfg["emitterStates"][0]["azimuthDeg"]
-        elevation_deg = lidar_cfg["emitterStates"][0]["elevationDeg"]
+        max_returns = lidar_cfg["maxReturns"]
+        azimuth_deg = lidar_cfg["azimuthDeg"]
+        elevation_deg = lidar_cfg["elevationDeg"]
         scan_rate_hz = int(lidar_cfg["scanRateBaseHz"])
         report_rate_hz = int(lidar_cfg["reportRateBaseHz"])
         columns_per_frame = int(report_rate_hz / scan_rate_hz)
