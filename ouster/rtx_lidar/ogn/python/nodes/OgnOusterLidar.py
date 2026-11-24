@@ -1,11 +1,9 @@
 import numpy as np
 import omni.graph.core as og
-import omni.kit.app
 import omni.timeline
 import omni.replicator.core as rep
 
 import socket
-import json
 import queue
 import threading
 import time
@@ -16,6 +14,8 @@ from ouster.sdk._bindings.client import PacketType
 from ouster.sdk.util.parsing import scan_to_packets
 
 from ouster.rtx_lidar.extension import HttpServer
+from ouster.rtx_lidar.rotation_accumulator import (GMO_MAGIC, create_rotation_accumulator, parse_gmo,
+                                                    schema_defines)
 
 
 class OgnOusterLidarInternalState:
@@ -30,8 +30,7 @@ class OgnOusterLidarInternalState:
         self.frame_id = 0
         self.pkt_count = 0
         self.scan = None
-        self.scan_range_m = None
-        self.scan_intensity = None
+        self.accumulator = None
         self.http_server = None
         self.http_server_error = ""
         self.sock_lidar = None
@@ -39,8 +38,8 @@ class OgnOusterLidarInternalState:
         self.packet_queue = None
         self.packet_sender_stop = None
         self.packet_sender_thread = None
-        self.elevation_lut_order = None
-        self.elevation_lut_deg_sorted = None
+        self.partial_rotations = 0
+        self.warned_partial_rotation = False
         self.max_returns = 1
         # Track last config to detect changes
         self._last_sensor_path = None
@@ -101,27 +100,81 @@ class OgnOusterLidar:
         print("Variant set 'sensor' not found on this prim.")
         return None
 
+    # Lidar profile field -> OmniLidar attribute names (omni:sensor:Core:*), newest first. Isaac Sim
+    # 6.0 renamed reportRateBaseHz to patternFiringRateHz; both versions carry the azimuth window as
+    # validStart/validEndAzimuthDeg (start/endAzimuthDeg are older names).
+    _PROFILE_ATTRIBUTES = (
+        ("numberOfEmitters", ("numberOfEmitters",)),
+        ("maxReturns", ("maxReturns",)),
+        ("scanRateBaseHz", ("scanRateBaseHz",)),
+        ("reportRateBaseHz", ("patternFiringRateHz", "reportRateBaseHz")),
+        ("rotationDirection", ("rotationDirection",)),
+        ("scanType", ("scanType",)),
+        ("startAzimuthDeg", ("validStartAzimuthDeg", "startAzimuthDeg")),
+        ("endAzimuthDeg", ("validEndAzimuthDeg", "endAzimuthDeg")),
+    )
+
     @staticmethod
-    def _compose_sensor_info(lidar_sensor_variant, udp_port_lidar, udp_port_imu, udp_dest):
-        """Build a SensorInfo from an RTX lidar config JSON file."""
-        ext_manager = omni.kit.app.get_app_interface().get_extension_manager()
-        ext_id = ext_manager.get_enabled_extension_id("isaacsim.sensors.rtx")
-        isaac_sim_ext_path = ext_manager.get_extension_path(ext_id)
-        # Derive sensor family (OS0, OS1, OS2) from variant name prefix
-        sensor_family = "OS0"  # default
-        for prefix in ("OS0", "OS1", "OS2"):
-            if lidar_sensor_variant.startswith(prefix):
-                sensor_family = prefix
-                break
-        lidar_config_path = f"{isaac_sim_ext_path}/data/lidar_configs/Ouster/{sensor_family}/{lidar_sensor_variant}.json"
-        print(f"Loading lidar config from {lidar_config_path}")
-        with open(lidar_config_path, "r") as f:
-            lidar_cfg = json.load(f)
-        lidar_cfg = lidar_cfg["profile"]
+    def _read_lidar_profile(prim):
+        """Read the firing pattern from the live OmniLidar prim -- what the sensor actually fires.
+
+        The Isaac RTX lidar config JSON is not used at runtime by Isaac and on 6.0 it only exists
+        in the deprecated isaacsim.sensors.rtx. Verified headless on 5.1 and 6.0 for OS0 REV6/REV7,
+        OS1 32/128 and OS2 (10/20 Hz, 512-2048 columns): every field below is present on the prim
+        and equals the shipped JSON, apart from that JSON bug.
+
+        For each field the first name with an *authored* value wins, then the first with any value
+        (schema fallback). Authored-first matters on 6.0 with a 5.1-authored asset such as the OS0 in
+        Lidar_Reflective_Room-minimal.usd: it authors reportRateBaseHz=10240 while
+        patternFiringRateHz resolves to the 6.0 schema fallback 36000 (3600 columns). The azimuth
+        window is unauthored on every Ouster asset, so its schema fallback (0/360) is what the model
+        uses.
+        """
+        profile, missing = {}, []
+        for key, names in OgnOusterLidar._PROFILE_ATTRIBUTES:
+            attrs = [prim.GetAttribute(f"omni:sensor:Core:{name}") for name in names]
+            attrs = [attr for attr in attrs if attr.IsValid() and attr.Get() is not None]
+            authored = [attr for attr in attrs if attr.HasAuthoredValue()]
+            if authored or attrs:
+                profile[key] = (authored or attrs)[0].Get()
+            else:
+                missing.append("/".join(names))
+        # One emitter state per "omni:sensor:Core:emitterState:<sNNN>:..." attribute group (6.0
+        # applies an OmniSensorGenericLidarCoreEmitterStateAPI instance per state; 5.1 has no
+        # emitterStateCount attribute on the prim).
+        profile["emitterStateCount"] = len({name.split(":")[4] for name in prim.GetPropertyNames()
+                                            if name.startswith("omni:sensor:Core:emitterState:")})
+        for key in ("azimuthDeg", "elevationDeg"):
+            value = prim.GetAttribute(f"omni:sensor:Core:emitterState:s001:{key}").Get()
+            if value is None or len(value) == 0:
+                missing.append(f"emitterState:s001:{key}")
+            else:
+                profile[key] = list(value)
+        if missing:
+            raise ValueError(f"OmniLidar {prim.GetPath()} lacks omni:sensor:Core attributes: {', '.join(missing)}")
+        return profile
+
+    @staticmethod
+    def _compose_sensor_info(lidar_sensor_variant, udp_port_lidar, udp_port_imu, udp_dest, sensor_path=None):
+        """Build the Ouster SensorInfo from the live OmniLidar prim at {sensor_path}/sensor (Isaac Sim 5.1 / 6.0)."""
+        import omni.usd
+        if not sensor_path:
+            raise ValueError("A sensor path is required to read the OmniLidar configuration")
+        prim = omni.usd.get_context().get_stage().GetPrimAtPath(f"{sensor_path}/sensor")
+        if not prim.IsValid() or prim.GetTypeName() != "OmniLidar":
+            raise ValueError(f"Indexed streaming requires an OmniLidar sensor prim at {sensor_path}/sensor")
+        lidar_cfg = OgnOusterLidar._read_lidar_profile(prim)
+        print(f"Composing Ouster metadata for {lidar_sensor_variant or prim.GetPath()} from {prim.GetPath()}")
+        if (lidar_cfg["scanType"].upper() != "ROTARY" or
+                lidar_cfg["rotationDirection"] != "CW" or
+                lidar_cfg["startAzimuthDeg"] != 0 or
+                lidar_cfg["endAzimuthDeg"] != 360 or
+                lidar_cfg["emitterStateCount"] != 1):
+            raise ValueError("Indexed streaming requires a full-circle CW lidar with one emitter state")
         num_channels = lidar_cfg["numberOfEmitters"]
-        max_returns = lidar_cfg.get("maxReturns", 1)
-        azimuth_deg = lidar_cfg["emitterStates"][0]["azimuthDeg"]
-        elevation_deg = lidar_cfg["emitterStates"][0]["elevationDeg"]
+        max_returns = lidar_cfg["maxReturns"]
+        azimuth_deg = lidar_cfg["azimuthDeg"]
+        elevation_deg = lidar_cfg["elevationDeg"]
         scan_rate_hz = int(lidar_cfg["scanRateBaseHz"])
         report_rate_hz = int(lidar_cfg["reportRateBaseHz"])
         columns_per_frame = int(report_rate_hz / scan_rate_hz)
@@ -143,11 +196,7 @@ class OgnOusterLidar:
         sensor_info.config.timestamp_mode = TimestampMode.TIME_FROM_INTERNAL_OSC
         sensor_info.beam_altitude_angles = np.array(elevation_deg, dtype=np.float64)
         sensor_info.beam_azimuth_angles = np.array(azimuth_deg, dtype=np.float64)
-        sensor_info.beam_to_lidar_transform = np.array(
-            [[1.0, 0.0, 0.0, 27.67],
-             [0.0, 1.0, 0.0, 0.0],
-             [0.0, 0.0, 1.0, 0.0],
-             [0.0, 0.0, 0.0, 1.0]], dtype=np.float64)
+        sensor_info.beam_to_lidar_transform = np.eye(4, dtype=np.float64)
         sensor_info.build_date = "2022-12-23T22:27:12Z"
         sensor_info.fw_rev = "v3.0.0-beta.2-23-gdbfc6371c"
         sensor_info.image_rev = "ousteros-image-prod-bootes-v3.0.0-beta.2+20221223222646"
@@ -161,18 +210,15 @@ class OgnOusterLidar:
              [0.0, 1.0, 0.0, -9.725],
              [0.0, 0.0, 1.0, 7.533],
              [0.0, 0.0, 0.0, 1.0]], dtype=np.float64)
-        sensor_info.lidar_to_sensor_transform = np.array(
-            [[1.0, 0.0, 0.0, 27.67],
-             [0.0, 1.0, 0.0, 0.0],
-             [0.0, 0.0, 1.0, 0.0],
-             [0.0, 0.0, 0.0, 1.0]], dtype=np.float64)
-        sensor_info.lidar_origin_to_beam_origin_mm = 27.67
+        sensor_info.lidar_to_sensor_transform = np.eye(4, dtype=np.float64)
+        sensor_info.lidar_origin_to_beam_origin_mm = 0.0
         sensor_info.format.column_window = [0, columns_per_frame - 1]
         sensor_info.format.columns_per_frame = columns_per_frame
         sensor_info.format.columns_per_packet = 16
         sensor_info.format.fps = scan_rate_hz
         sensor_info.format.header_type = HeaderType.STANDARD
-        sensor_info.format.pixel_shift_by_row = [0] * num_channels
+        sensor_info.format.pixel_shift_by_row = np.rint(
+            np.asarray(azimuth_deg) * columns_per_frame / 360.0).astype(int).tolist()
         sensor_info.format.imu_measurements_per_packet = 0
         sensor_info.format.imu_packets_per_frame = 0
         sensor_info.format.pixels_per_column = num_channels
@@ -183,7 +229,42 @@ class OgnOusterLidar:
 
     @staticmethod
     def _setup_pipeline(state, sensor_path):
-        """Create Render Product and annotator for the given sensor path."""
+        """Read spherical GMO before ScanBuffer discards invalid rays and firing IDs."""
+        import omni.usd
+        from pxr import Sdf
+        prim = omni.usd.get_context().get_stage().GetPrimAtPath(f"{sensor_path}/sensor")
+        for name, value in (("elementsCoordsType", "SPHERICAL"),
+                            ("outputFrameOfReference", "SENSOR"),
+                            ("outputMotionCompensationState", "NONCOMPENSATED")):
+            prim.CreateAttribute(f"omni:sensor:Core:{name}", Sdf.ValueTypeNames.Token).Set(value)
+        prim.CreateAttribute("omni:sensor:Core:skipDroppingInvalidPoints", Sdf.ValueTypeNames.Bool).Set(True)
+        # Aux level (tickId/channelId/emitterId): 5.1 reads Core:auxOutputType;
+        # 6.0 removed it from the schema and reads the RenderVar channels
+        # attribute (what isaacsim.sensors.experimental.rtx authors). Branch on
+        # the schema rather than writing both, so neither version gets an
+        # unknown attribute. Verified headless: header auxType == BASIC on both.
+        if schema_defines(prim, "omni:sensor:Core:auxOutputType"):
+            prim.GetAttribute("omni:sensor:Core:auxOutputType").Set("BASIC")
+        else:
+            prim.CreateAttribute("_replicator:rendervar:GenericModelOutput:channels",
+                                 Sdf.ValueTypeNames.StringArray, True).Set(["BASIC"])
+        # Rotation assembly: sensor-side accumulation where the schema offers it
+        # (6.0), per-frame batch stitching otherwise (5.1). Sets accumulateOutputs.
+        state.accumulator = create_rotation_accumulator(
+            prim, state.sensor_info.format.columns_per_frame, state.sensor_info.format.pixels_per_column,
+            state.max_returns)
+        # 6.0 fires at Core:patternFiringRateHz, the renamed reportRateBaseHz. A
+        # 5.1-authored asset (the OS0 referenced by
+        # Lidar_Reflective_Room-minimal.usd) authors only reportRateBaseHz, so
+        # 6.0 falls back to the schema's 36000 Hz and, for that OS0, produced no
+        # GMO elements at all (measured: 0 of 200 frames; 43776 per frame, ticks
+        # 0..1023, once set to 10240). Carry the authored rate over. On 5.1 the
+        # schema has no patternFiringRateHz, so this is a no-op there.
+        pattern_rate = prim.GetAttribute("omni:sensor:Core:patternFiringRateHz")
+        legacy_rate = prim.GetAttribute("omni:sensor:Core:reportRateBaseHz")
+        if (schema_defines(prim, "omni:sensor:Core:patternFiringRateHz") and not pattern_rate.HasAuthoredValue()
+                and legacy_rate.IsValid() and legacy_rate.HasAuthoredValue()):
+            pattern_rate.Set(int(legacy_rate.Get()))
         state.render_product = rep.create.render_product(
             f"{sensor_path}/sensor", [1, 1],
             name="OgnOusterLidarRenderProduct",
@@ -191,16 +272,7 @@ class OgnOusterLidar:
         )
         state.render_product_path = state.render_product.path
 
-        state.annotator = rep.AnnotatorRegistry.get_annotator("IsaacCreateRTXLidarScanBuffer")
-        state.annotator.initialize(
-            outputIntensity=True,
-            outputDistance=True,
-            keepOnlyPositiveDistance=False,
-            transformPoints=False,
-            outputTimestamp=True,
-            outputAzimuth=True,
-            outputElevation=True
-        )
+        state.annotator = rep.AnnotatorRegistry.get_annotator("GenericModelOutput", device="cpu")
         state.annotator.attach([state.render_product_path])
 
     @staticmethod
@@ -217,8 +289,9 @@ class OgnOusterLidar:
         state.scan = LidarScan(state.sensor_info)
         state.frame_id = 0
         state.pkt_count = 0
-        state.scan_range_m = None
-        state.scan_intensity = None
+        if state.accumulator is not None:
+            state.accumulator.reset()
+        state.partial_rotations = 0
         state.packet_queue = queue.Queue()
         state.packet_sender_stop = threading.Event()
 
@@ -307,8 +380,6 @@ class OgnOusterLidar:
             state.http_server = None
 
         state.scan = None
-        state.scan_range_m = None
-        state.scan_intensity = None
         state.frame_id = 0
         state.pkt_count = 0
 
@@ -321,37 +392,11 @@ class OgnOusterLidar:
             except Exception:
                 pass
         state.annotator = None
+        state.accumulator = None
         if state.render_product:
             state.render_product.destroy()
         state.render_product = None
         state.render_product_path = None
-
-    @staticmethod
-    def _map_distance_to_u_v(state, width, height, distance, intensity, azimuth, elevation):
-        """Map flat distance/intensity arrays into a 2D scan image."""
-        if (state.scan_range_m is None or state.scan_range_m.shape != (height, width)):
-            state.scan_range_m = np.zeros((height, width), dtype=np.float32)
-            state.scan_intensity = np.zeros((height, width), dtype=np.float32)
-        else:
-            state.scan_range_m.fill(0)
-            state.scan_intensity.fill(0)
-
-        elevation_lut = state.elevation_lut_deg_sorted
-        elevation_order = state.elevation_lut_order
-
-        insert_idx = np.searchsorted(elevation_lut, elevation, side="left")
-        right_idx = np.clip(insert_idx, 0, height - 1)
-        left_idx = np.clip(insert_idx - 1, 0, height - 1)
-        use_right = np.abs(elevation_lut[right_idx] - elevation) < np.abs(elevation - elevation_lut[left_idx])
-        u = np.where(use_right, elevation_order[right_idx], elevation_order[left_idx]).astype(np.intp, copy=False)
-        np.clip(u, 0, height - 1, out=u)
-
-        v = np.floor(np.remainder(azimuth, 360.0) * (width / 360.0)).astype(np.intp)
-        np.clip(v, 0, width - 1, out=v)
-
-        state.scan_range_m[u, v] = distance
-        state.scan_intensity[u, v] = intensity
-        return state.scan_range_m, state.scan_intensity
 
     @staticmethod
     def compute(db) -> bool:
@@ -391,15 +436,11 @@ class OgnOusterLidar:
 
             try:
                 state.sensor_info, state.max_returns = OgnOusterLidar._compose_sensor_info(
-                    sensor_variant, udp_port_lidar, udp_port_imu, udp_dest)
+                    sensor_variant, udp_port_lidar, udp_port_imu, udp_dest, sensor_path)
             except Exception as error:
                 db.log_error(f"Failed to load lidar config: {error}")
                 db.outputs.execOut = og.ExecutionAttributeState.DISABLED
                 return False
-
-            elevation_lut_deg = np.array(state.sensor_info.beam_altitude_angles, dtype=np.float64)
-            state.elevation_lut_order = np.argsort(elevation_lut_deg)
-            state.elevation_lut_deg_sorted = elevation_lut_deg[state.elevation_lut_order]
 
             OgnOusterLidar._setup_pipeline(state, sensor_path)
 
@@ -432,37 +473,42 @@ class OgnOusterLidar:
             db.outputs.lastClientAddr = ""
         db.outputs.packetsSent = state.pkt_count
 
-        if not enabled or state.annotator is None:
+        if not enabled or state.annotator is None or state.scan is None:
             db.outputs.execOut = og.ExecutionAttributeState.DISABLED
             return True
 
         scan_data = state.annotator.get_data()
-        if scan_data is None or "distance" not in scan_data or "intensity" not in scan_data:
+        if scan_data is None or len(scan_data) == 0:
             db.outputs.execOut = og.ExecutionAttributeState.ENABLED
             return True
 
-        distance = np.asarray(scan_data["distance"])
-        intensity = np.asarray(scan_data["intensity"])
-        azimuth = np.asarray(scan_data["azimuth"])
-        elevation = np.asarray(scan_data["elevation"])
-
-        if distance.size == 0 or intensity.size == 0 or azimuth.size == 0 or elevation.size == 0:
+        gmo = parse_gmo(scan_data)
+        if gmo.magicNumber != GMO_MAGIC or gmo.numElements == 0:
             db.outputs.execOut = og.ExecutionAttributeState.ENABLED
             return True
+        accumulator = state.accumulator
+        if not accumulator.add(gmo):
+            db.outputs.execOut = og.ExecutionAttributeState.ENABLED
+            return True
+        if accumulator.coverage < 1.0:
+            state.partial_rotations += 1
+            if not state.warned_partial_rotation:
+                state.warned_partial_rotation = True
+                db.log_warn(
+                    f"OgnOusterLidar: published a rotation with {100 * (1 - accumulator.coverage):.0f}% of "
+                    "columns zero-filled (a GMO frame was superseded before this node read it). Further partial "
+                    "rotations are counted in state.partial_rotations and not logged.")
 
         width = int(state.sensor_info.format.columns_per_frame)
-        height = int(state.sensor_info.format.pixels_per_column)
-
-        scan_range_m, scan_intensity = OgnOusterLidar._map_distance_to_u_v(
-            state, width, height, distance, intensity, azimuth, elevation)
+        scan_range_m, scan_intensity = accumulator.range_m, accumulator.intensity
 
         state.frame_id += 1
         state.scan.frame_id = state.frame_id
         state.scan.field("RANGE")[:] = np.where(scan_range_m > 0, scan_range_m * 1e+3, 0).astype(np.uint32)
         state.scan.field("REFLECTIVITY")[:] = np.clip(scan_intensity * 255.0, 0, 255).astype(np.uint8)
 
-        ts = np.linspace(0, 1 / 10.0, width)
-        timestamps = 1e9 * (state.frame_id / 10.0 + ts)
+        fps = state.sensor_info.format.fps
+        timestamps = 1e9 * (state.frame_id / fps + np.arange(width) / (width * fps))
         state.scan.timestamp[:] = timestamps
         state.scan.status[:] = 0x1
         packet_count = len(state.scan.packet_timestamp)

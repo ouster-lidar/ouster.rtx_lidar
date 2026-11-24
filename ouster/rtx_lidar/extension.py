@@ -22,8 +22,6 @@ def ts_format(ts):
     return datetime.fromtimestamp(ts * 1e-9, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f %Z')
 
 
-app = Flask(__name__)
-
 class PacketSourcePacer():
 
     def __init__(self, packet_source_factory, rate, loop=False):
@@ -169,6 +167,17 @@ class HttpServer():
         self._autostart = autostart
         self.last_client_addr = ""
         self.bind_error = ""
+        # One Flask app per HttpServer. The routes below are closures over
+        # `self`, so they cannot be shared: registering them on a module-level
+        # app worked only for the first HttpServer in the Kit process. Any
+        # later instance (node reinit, release + re-create, fswatcher hot
+        # reload of the node module, which does not reload this module) raised
+        # AssertionError "setup method 'route' can no longer be called" once
+        # the first app had served a request, or "View function mapping is
+        # overwriting an existing endpoint function" if it had not.
+        # Keep __name__ so template/static lookup is unchanged.
+        app = Flask(__name__)
+        self._app = app
 
         def _sensor_info_as_json(sensor_info):
             sensor_info_json = json.loads(sensor_info.to_json_string())
@@ -644,7 +653,7 @@ class HttpServer():
 
         try:
             from waitress import create_server
-            self._waitress_server = create_server(app, host=self._http_addr, port=self._http_port)
+            self._waitress_server = create_server(self._app, host=self._http_addr, port=self._http_port)
         except PermissionError as e:
             self.bind_error = f"PermissionError: {e}"
             click.secho("Permission error!", fg='red')

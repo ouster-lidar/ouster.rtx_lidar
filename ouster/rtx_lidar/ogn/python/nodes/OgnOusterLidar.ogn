@@ -1,9 +1,9 @@
 {
     "OgnOusterLidar": {
-        "version": 2,
+        "version": 1,
         "description": "Ouster RTX Lidar streaming node. Reads the RTX lidar sensor output, converts it to Ouster SDK format, and streams UDP packets to an Ouster client.",
         "language": "Python",
-        "categories": ["isaacSensor"],
+        "categories": {"isaacSensor": "Isaac Sim sensor nodes"},
         "metadata": {
             "uiName": "Ouster RTX Lidar"
         },
