@@ -1,6 +1,6 @@
 {
     "OgnOusterLidar": {
-        "version": 2,
+        "version": 3,
         "description": "Ouster RTX Lidar streaming node. Reads the RTX lidar sensor output, converts it to Ouster SDK format, and streams UDP packets to an Ouster client.",
         "language": "Python",
         "categories": ["isaacSensor"],
@@ -22,7 +22,7 @@
             },
             "sensorVariant": {
                 "type": "string",
-                "description": "Ouster sensor variant name (e.g. OS0_REV7_128ch10hz1024res). If empty, auto-read from the sensorModelConfig attribute on the sensor prim.",
+                "description": "Ouster sensor variant name (e.g. OS0_REV7_128ch10hz1024res). If empty, auto-read from the 'sensor' USD variant set on the sensor prim.",
                 "default": "",
                 "metadata": {
                     "uiName": "Sensor Variant (optional)"
@@ -74,6 +74,14 @@
                 "default": true,
                 "metadata": {
                     "uiName": "Enabled"
+                }
+            },
+            "sensorSn": {
+                "type": "int64",
+                "description": "Virtual sensor serial number. Default 1234567890 is Sensor #1 (the identity the Ouster Detect license was activated against). For additional sensors use 1234567890 + (N-1) per SENSOR_CONVENTION.md. init_id is derived automatically as 7777777 + (sn - 1234567890).",
+                "default": 1234567890,
+                "metadata": {
+                    "uiName": "Sensor Identity: Serial Number"
                 }
             }
         },

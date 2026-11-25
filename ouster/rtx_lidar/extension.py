@@ -1,3 +1,27 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Jorge Octavio Martinez Tovar
+"""ouster.rtx_lidar -- sensor HTTP API emulation and pcap replay.
+
+This module provides two independent pieces:
+
+1. HttpServer -- an emulation of the Ouster sensor HTTP API (metadata,
+   config, telemetry, alerts, and the browser dashboard) backed by a live
+   SensorInfo object. This is the component the Isaac Sim OGN node
+   (OgnOusterLidar) imports: it is what makes Ouster Detect / ouster-cli
+   discover and configure the virtual sensor as if it were hardware.
+   CHECKPOINT A (B1): each HttpServer instance owns its own Flask app, so
+   multiple virtual sensors coexist in one process (each bound to its own
+   NIC IP on port 80; see SENSOR_CONVENTION.md).
+
+2. ScanSourceUdpReplay / PacketSourcePacer / mDNSService -- a standalone
+   pcap replay tool that re-emits a recorded physical-sensor capture over
+   UDP with realtime pacing. NOT used by the Isaac Sim workflow; kept
+   as-is and unmaintained (see the marker above ScanSourceUdpReplay).
+
+Author / maintainer: Jorge Octavio Martinez Tovar
+                     (Digital Twin Engineering, Ternium Pesqueria)
+"""
+
 import socket
 import psutil
 import ipaddress
@@ -22,7 +46,13 @@ def ts_format(ts):
     return datetime.fromtimestamp(ts * 1e-9, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f %Z')
 
 
-app = Flask(__name__)
+# CHECKPOINT A / B1: the module-level `app = Flask(__name__)` was REMOVED.
+# It was the root cause of the multi-sensor blocker: every HttpServer
+# registered its routes on the shared global app, so a second sensor node
+# raised AssertionError (duplicate endpoint names) at construction, and
+# hot-reload of the extension re-registered routes on the surviving global.
+# Each HttpServer now owns its own Flask app (see HttpServer.__init__).
+
 
 class PacketSourcePacer():
 
@@ -170,6 +200,15 @@ class HttpServer():
         self.last_client_addr = ""
         self.bind_error = ""
 
+        # B1: per-instance Flask app. Each HttpServer owns its own app, so
+        # multiple sensor nodes (each with its own HTTP port) no longer
+        # collide on a shared module-global route map. Flask(__name__) keeps
+        # template resolution working for the dashboard routes. The local
+        # name `app` deliberately shadows nothing at module level anymore;
+        # every @app.route below binds to THIS instance's app.
+        self._app = Flask(__name__)
+        app = self._app
+
         def _sensor_info_as_json(sensor_info):
             sensor_info_json = json.loads(sensor_info.to_json_string())
             if "zone_set" in sensor_info_json:
@@ -212,7 +251,10 @@ class HttpServer():
                     return jsonify({"error": {
                         "title": "500 Internal Server Error",
                         "description": "Command \"set_config_param\" failed: error: Expected 1-2 arguments"}})
+                # CHECKPOINT B: logged for client-protocol visibility.
+                print(f"[sensor API] POST /sensor/config from {request.remote_addr}: {sensor_config}")
                 self.configure_sensor(sensor_config, request.remote_addr)
+                self.last_client_addr = request.remote_addr
                 return jsonify({"message": "Configuration updated successfully"})
             elif request.method == 'DELETE':
                 # sensor_config.clear()
@@ -233,19 +275,50 @@ class HttpServer():
 
         @app.route('/api/v1/sensor/cmd/set_udp_dest_auto', methods=['GET'])
         def set_udp_dest_auto():
+            # CHECKPOINT B: logged for client-protocol visibility.
+            print(f"[sensor API] set_udp_dest_auto from {request.remote_addr}")
             self._sensor.sensor_info.config.udp_dest = request.remote_addr
             self.last_client_addr = request.remote_addr
             return "{}"
 
         @app.route('/api/v1/sensor/cmd/set_config_param', methods=['GET', 'POST', 'DELETE'])
         def set_config_param():
-            # parse the lidar udp and imu udp from the request
+            # CHECKPOINT B: dual-format parser. Real Ouster sensors accept
+            # BOTH arg formats on this endpoint and clients use both:
+            #   JSON:            args={"udp_dest": "10.125.21.1", ...}
+            #   space-separated: args=udp_dest 10.125.21.1
+            # The previous implementation handled JSON only; a client using
+            # the space-separated form (observed with Detect for udp_dest)
+            # got a 500 and its push was silently lost, leaving the node
+            # streaming to a stale/empty destination while the client
+            # believed the sensor was configured. Every request is logged
+            # so the exact client protocol is visible in the console.
             args = request.args.get('args')
+            print(f"[sensor API] set_config_param from {request.remote_addr}: {args!r}")
             sensor_config = {}
-            try:
-                args = args[args.index('{'):]
-                sensor_config = json.loads(args)
-            except Exception:
+            parsed = False
+            if args:
+                # Attempt 1: JSON payload (with or without leading junk)
+                try:
+                    sensor_config = json.loads(args[args.index('{'):])
+                    parsed = True
+                except (ValueError, TypeError):
+                    pass
+                # Attempt 2: "param value" space-separated form
+                if not parsed:
+                    parts = args.strip().split(None, 1)
+                    if len(parts) == 2:
+                        key, value = parts[0], parts[1].strip().strip('"')
+                        if key in ("udp_port_lidar", "udp_port_imu", "udp_port_zm"):
+                            try:
+                                sensor_config = {key: int(value)}
+                                parsed = True
+                            except ValueError:
+                                pass
+                        else:
+                            sensor_config = {key: value}
+                            parsed = True
+            if not parsed:
                 return jsonify({"error": {
                     "title": "500 Internal Server Error",
                     "description": "Command \"set_config_param\" failed: error: Expected 1-2 arguments"}})
@@ -644,7 +717,8 @@ class HttpServer():
 
         try:
             from waitress import create_server
-            self._waitress_server = create_server(app, host=self._http_addr, port=self._http_port)
+            # B1: serve THIS instance's app, not a module global.
+            self._waitress_server = create_server(self._app, host=self._http_addr, port=self._http_port)
         except PermissionError as e:
             self.bind_error = f"PermissionError: {e}"
             click.secho("Permission error!", fg='red')
@@ -696,6 +770,11 @@ class HttpServer():
         print("http server stopped")
 
 
+# ============================================================================
+# REPLAY PATH (ScanSourceUdpReplay / PacketSourcePacer usage below + mDNS):
+# confirmed NOT in use for the Isaac Sim workflow (2026-07). Kept as-is,
+# unmaintained. The Isaac node only imports HttpServer from this module.
+# ============================================================================
 class ScanSourceUdpReplay():
 
     def __init__(self, packet_source_factory, source_url, http_addr, http_port, loop, rate, soft_id_check, lidar_port=-1,
@@ -812,4 +891,3 @@ class ScanSourceUdpReplay():
 
         sock_lidar.close()
         sock_imu.close()
-

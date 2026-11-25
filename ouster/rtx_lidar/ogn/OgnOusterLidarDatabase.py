@@ -8,6 +8,9 @@ file. In this environment the autogen pipeline does not run on extension
 toggle or Isaac Sim restart, so this file is maintained by hand to mirror
 the .ogn schema exactly. extension.toml excludes "Ogn*Database.py" from
 fswatcher, so this file is not at risk of being silently overwritten.
+
+CHECKPOINT A: added inputs:sensorSn (batched index 9). The matching block
+MUST also be added to the .ogn JSON schema (see SENSOR_CONVENTION.md).
 """
 
 import sys
@@ -35,6 +38,7 @@ class OgnOusterLidarDatabase(og.Database):
             inputs.udpPortLidar
             inputs.udpPortImu
             inputs.enabled
+            inputs.sensorSn
         Outputs:
             outputs.execOut
             outputs.frameId
@@ -52,13 +56,14 @@ class OgnOusterLidarDatabase(og.Database):
     INTERFACE = og.Database._get_interface([
         ('inputs:execIn', 'execution', 0, None, 'Execution input - connect to OnPlaybackTick or OnTick', {ogn.MetadataKeys.DEFAULT: '0'}, True, 0, False, ''),
         ('inputs:sensorPath', 'string', 0, 'Sensor Prim Path', 'USD path to the RTX Lidar sensor prim in the stage', {ogn.MetadataKeys.DEFAULT: '""'}, True, "", False, ''),
-        ('inputs:sensorVariant', 'string', 0, 'Sensor Variant (optional)', 'Ouster sensor variant name (e.g. OS0_REV7_128ch10hz1024res). If empty, auto-read from the sensorModelConfig attribute on the sensor prim.', {ogn.MetadataKeys.DEFAULT: '""'}, True, "", False, ''),
+        ('inputs:sensorVariant', 'string', 0, 'Sensor Variant (optional)', 'Ouster sensor variant name (e.g. OS0_REV7_128ch10hz1024res). If empty, auto-read from the "sensor" USD variant set on the sensor prim.', {ogn.MetadataKeys.DEFAULT: '""'}, True, "", False, ''),
         ('inputs:httpAddr', 'string', 0, 'HTTP Bind Address', 'Bind address for the HTTP metadata server. Use 0.0.0.0 to listen on all interfaces (required for Detect/Catalyst to reach it), or 127.0.0.1 for loopback-only testing.', {ogn.MetadataKeys.DEFAULT: '"0.0.0.0"'}, True, "0.0.0.0", False, ''),
         ('inputs:httpPort', 'int', 0, 'HTTP Port', 'HTTP server port for the sensor metadata API', {ogn.MetadataKeys.DEFAULT: '8080'}, True, 8080, False, ''),
         ('inputs:udpDest', 'string', 0, 'UDP Destination', 'UDP destination address for lidar/IMU packets', {ogn.MetadataKeys.DEFAULT: '"127.0.0.1"'}, True, "127.0.0.1", False, ''),
         ('inputs:udpPortLidar', 'int', 0, 'UDP Port (Lidar)', 'UDP port for lidar data packets', {ogn.MetadataKeys.DEFAULT: '7502'}, True, 7502, False, ''),
         ('inputs:udpPortImu', 'int', 0, 'UDP Port (IMU)', 'UDP port for IMU data packets', {ogn.MetadataKeys.DEFAULT: '7503'}, True, 7503, False, ''),
         ('inputs:enabled', 'bool', 0, 'Enabled', 'Enable or disable UDP streaming', {ogn.MetadataKeys.DEFAULT: 'true'}, True, True, False, ''),
+        ('inputs:sensorSn', 'int64', 0, 'Sensor Identity: Serial Number', 'Virtual sensor serial number. Default 1234567890 is Sensor #1 (the identity the Ouster Detect license was activated against). For additional sensors use 1234567890 + (N-1) per SENSOR_CONVENTION.md. init_id is derived automatically as 7777777 + (sn - 1234567890).', {ogn.MetadataKeys.DEFAULT: '1234567890'}, True, 1234567890, False, ''),
         ('outputs:execOut', 'execution', 0, None, 'Execution output', {}, True, None, False, ''),
         ('outputs:frameId', 'int64', 0, 'Frame ID', 'Current frame ID being streamed', {ogn.MetadataKeys.DEFAULT: '0'}, True, 0, False, ''),
         ('outputs:httpBoundAddr', 'string', 0, 'HTTP Bound Address', 'Actual address:port the HTTP server bound to, or empty/error text if bind failed', {ogn.MetadataKeys.DEFAULT: '""'}, True, "", False, ''),
@@ -78,7 +83,7 @@ class OgnOusterLidarDatabase(og.Database):
     class ValuesForInputs(og.DynamicAttributeAccess):
         LOCAL_PROPERTY_NAMES = {
             "execIn", "sensorPath", "sensorVariant", "httpAddr", "httpPort",
-            "udpDest", "udpPortLidar", "udpPortImu", "enabled",
+            "udpDest", "udpPortLidar", "udpPortImu", "enabled", "sensorSn",
             "_setting_locked", "_batchedReadAttributes", "_batchedReadValues"
         }
 
@@ -95,6 +100,7 @@ class OgnOusterLidarDatabase(og.Database):
                 self._attributes.udpPortLidar,
                 self._attributes.udpPortImu,
                 self._attributes.enabled,
+                self._attributes.sensorSn,
             ]
             self._batchedReadValues = [
                 0,
@@ -106,6 +112,7 @@ class OgnOusterLidarDatabase(og.Database):
                 7502,
                 7503,
                 True,
+                1234567890,
             ]
 
         @property
@@ -179,6 +186,14 @@ class OgnOusterLidarDatabase(og.Database):
         @enabled.setter
         def enabled(self, value):
             self._batchedReadValues[8] = value
+
+        @property
+        def sensorSn(self):
+            return self._batchedReadValues[9]
+
+        @sensorSn.setter
+        def sensorSn(self, value):
+            self._batchedReadValues[9] = value
 
         def __getattr__(self, item: str):
             if item in self.LOCAL_PROPERTY_NAMES:
